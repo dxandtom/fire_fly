@@ -1,0 +1,45 @@
+# 流萤 · Claude Code 桌宠
+
+《崩坏：星穹铁道》流萤的像素风桌宠（Windows）。跟随 Claude Code 的工作状态做出反应：思考和用工具时忙碌、需要你授权时招手、出错时沮丧、完成时跳起来等你验收；空闲时眼睛跟着鼠标转，可拖动、可摸头，带经验与等级成长。
+
+精灵表来自 Codex 宠物生成流程（8 列 × 11 行，每格 192×208），用 libimagequant 压成 256 色调色板 PNG（2993KB → 806KB，均方根误差 2.2/255，肉眼几乎无差别），原始无损版保留在本地 `虚拟宠物/outputs/firefly-spritesheet.png`。
+
+## 安装（新电脑）
+
+要求：Windows 10/11（自带 .NET Framework 4.x 即可，不需要 Node）。
+
+在 Claude Code 里依次运行：
+
+```
+/plugin marketplace add <你的 GitHub 用户名>/<仓库名>
+/plugin install firefly-pet@firefly
+```
+
+私有仓库需要这台电脑的 git 能访问 GitHub（首次会弹出登录）。
+
+装好后开一个新会话或发一条消息，流萤就会出现在桌面右下角。右键她 →「开机自启」，以后 Claude 桌面端一打开她就出现、关掉就跟着退出。
+
+## 经验数据
+
+等级和经验保存在 `~/.claude/firefly-pet/stats.json`，不在仓库里。换电脑想保留等级，把这个文件复制到新电脑同一位置即可。
+
+## 工作方式
+
+- `plugins/firefly-pet/hooks/hooks.json`：注册 13 个 Claude Code 事件，每个事件调用 `FireflyPet.exe --hook`，把精简后的事件追加到 `~/.claude/firefly-pet/events.jsonl`。
+- 开会话或发消息时，hook 会把 exe 和素材同步到 `~/.claude/firefly-pet/app/`（固定路径，插件升级后开机自启也不会失效），并在桌宠没运行时启动它。
+- `FireflyPet.exe --watch`：开机自启的守护进程，Claude 桌面端从关闭变为打开时拉起桌宠。
+- 只有 Claude Code（桌面端 Code 标签页或 CLI）会触发 hook；普通聊天时流萤只会陪着你，不会有工作状态动画。
+
+## 修改与发布
+
+```
+node build.js        # 编译 src/FireflyPet.cs → plugins/firefly-pet/bin/FireflyPet.exe
+```
+
+改完后提交新的 exe，并升级 `plugins/firefly-pet/.claude-plugin/plugin.json` 里的 `version`，其他电脑在 `/plugin` 里更新即可。
+
+调试参数：`--demo` 自动演示全部动作，`--snap <目录>` 每秒把窗口截图存成 PNG，`--data <目录>` 使用另一份数据目录。
+
+## 卸载
+
+`/plugin uninstall firefly-pet@firefly`，再在流萤右键菜单里关掉「开机自启」（或先关掉再卸载）。经验数据在 `~/.claude/firefly-pet/`，不需要的话手动删除。

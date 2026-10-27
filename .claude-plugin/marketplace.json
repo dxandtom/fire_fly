@@ -1,0 +1,15 @@
+{
+  "name": "firefly",
+  "description": "流萤 · Claude Code 桌宠",
+  "owner": {
+    "name": "firefly-pet"
+  },
+  "plugins": [
+    {
+      "name": "firefly-pet",
+      "description": "《崩坏：星穹铁道》流萤的像素风桌宠：跟随 Claude Code 的工作状态做出反应，带经验与等级成长（仅 Windows）。",
+      "source": "./plugins/firefly-pet",
+      "category": "fun"
+    }
+  ]
+}

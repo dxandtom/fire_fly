@@ -1,0 +1,15 @@
+{
+  "id": "pet_6ad3345d9a188191a8df466e89681eee",
+  "name": "流萤",
+  "description": "《崩坏：星穹铁道》流萤的像素风伙伴：温柔真诚、略带羞涩，认真时坚定专注。",
+  "is_custom": true,
+  "active_pet_id": "pet_6ad3345d9a188191a8df466e89681eee",
+  "spritesheet": "firefly-spritesheet.png",
+  "sha256": "b5a80d6da65ae3c239ce2d6332601e6e150f28bd39460afa555328ba65fa44ad",
+  "generation_mode": "built-in image_gen",
+  "prompt_set": "archive: firefly-pixel/prompts",
+  "storage": "local, authorized by user",
+  "verification": "listed and active",
+  "source_sha256": "90f4c8e3a307c6bd122684b6438a3ea53fdc1c0dcc53036dcf26d29afd324be9",
+  "optimized": "libimagequant 256 色调色板 + 抖动（原图 2993KB → 806KB，均方根误差 2.2/255）"
+}
