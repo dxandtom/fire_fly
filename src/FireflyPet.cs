@@ -51,6 +51,7 @@ namespace FireflyPet
                 else if (args[i] == "--watch") watch = true;
                 else if (args[i] == "--hook") hook = true;
                 else if (args[i] == "--handbook") HandbookOnStart = true;
+                else if (args[i] == "--focus-claude") return Desk.FocusClaude();
             }
             Directory.CreateDirectory(DataDir);
             if (hook) return Hook.Run();
@@ -199,11 +200,13 @@ namespace FireflyPet
 
     static class Desk
     {
-        // 把 Claude 桌面端的主窗口切到最前面；找不到窗口返回 false
-        public static bool FocusClaude()
+        public const int FocusOk = 0, FocusNotFound = 1, FocusFlashed = 2;
+
+        // 把 Claude 桌面端的主窗口切到最前面
+        public static int FocusClaude()
         {
             var pids = Watcher.DesktopPids();
-            if (pids.Count == 0) return false;
+            if (pids.Count == 0) return FocusNotFound;
             IntPtr found = IntPtr.Zero;
             EnumWindows((h, l) =>
             {
@@ -213,16 +216,34 @@ namespace FireflyPet
                 found = h;
                 return false;
             }, IntPtr.Zero);
-            if (found == IntPtr.Zero) return false;
+            if (found == IntPtr.Zero) return FocusNotFound;
             if (IsIconic(found)) ShowWindow(found, SW_RESTORE);
-            if (!SetForegroundWindow(found))
+            SetForegroundWindow(found);
+            if (GetForegroundWindow() != found)
             {
-                // 前台锁：模拟按一下 Alt 再试（常见做法，系统才允许切换前台）
+                // 前台锁：模拟按一下 Alt，再借前台窗口的输入队列切换（常见做法）
                 keybd_event(VK_MENU, 0, 0, UIntPtr.Zero);
                 keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+                int dummy;
+                int fgThread = GetWindowThreadProcessId(GetForegroundWindow(), out dummy), me = GetCurrentThreadId();
+                bool attached = fgThread != 0 && fgThread != me && AttachThreadInput(me, fgThread, true);
+                BringWindowToTop(found);
                 SetForegroundWindow(found);
+                if (attached) AttachThreadInput(me, fgThread, false);
             }
-            return true;
+            if (GetForegroundWindow() == found) return FocusOk;
+            var fi = new FLASHWINFO { cbSize = Marshal.SizeOf(typeof(FLASHWINFO)), hwnd = found, dwFlags = 3 | 12 /* 标题+任务栏，直到切到前台 */, uCount = 5 };
+            FlashWindowEx(ref fi);
+            Program.Log("切换到 Claude 被系统拦下，改为闪烁任务栏");
+            return FocusFlashed;
+        }
+
+        // 用户多久没碰键盘鼠标了
+        public static double IdleSeconds()
+        {
+            var li = new LASTINPUTINFO { cbSize = Marshal.SizeOf(typeof(LASTINPUTINFO)) };
+            if (!GetLastInputInfo(ref li)) return 0;
+            return unchecked((uint)Environment.TickCount - li.dwTime) / 1000.0;
         }
 
         // 前台窗口是否在 self 所在的显示器上全屏（桌面、任务栏本身不算）
@@ -244,7 +265,14 @@ namespace FireflyPet
 
         [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
         [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public int cbSize; public RECT Monitor, Work; public int Flags; }
+        [StructLayout(LayoutKind.Sequential)] struct FLASHWINFO { public int cbSize; public IntPtr hwnd; public int dwFlags; public int uCount; public int dwTimeout; }
+        [StructLayout(LayoutKind.Sequential)] struct LASTINPUTINFO { public int cbSize; public uint dwTime; }
         delegate bool EnumProc(IntPtr h, IntPtr l);
+        [DllImport("user32.dll")] static extern bool FlashWindowEx(ref FLASHWINFO fi);
+        [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO li);
+        [DllImport("user32.dll")] static extern bool AttachThreadInput(int from, int to, bool attach);
+        [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
+        [DllImport("kernel32.dll")] static extern int GetCurrentThreadId();
         const int GW_OWNER = 4, SW_RESTORE = 9, MONITOR_DEFAULTTONEAREST = 2, KEYEVENTF_KEYUP = 2;
         const byte VK_MENU = 0x12;
         [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
@@ -478,12 +506,14 @@ namespace FireflyPet
         public bool LookAtCursor { get; set; }
         public bool Wander { get; set; }
         public bool HideInFullscreen { get; set; } // 前台全屏（看视频、演示、游戏）时自动隐藏
+        public bool PixelSharp { get; set; }       // 最近邻缩放，像素边缘更锐利
+        public bool SystemNotify { get; set; }     // 看不到她（隐藏、全屏、人走开）时弹系统通知
         public string Spritesheet { get; set; }
         public string PetName { get; set; }
 
         public Config()
         {
-            Scale = 0.7; AutoStart = true; FollowClaude = true; Bubbles = "all"; LookAtCursor = true; HideInFullscreen = true;
+            Scale = 0.7; AutoStart = true; FollowClaude = true; Bubbles = "all"; LookAtCursor = true; HideInFullscreen = true; SystemNotify = true;
             Spritesheet = "firefly-spritesheet.png"; PetName = "流萤";
         }
     }
@@ -501,8 +531,50 @@ namespace FireflyPet
         public string Today { get; set; }
         public int TodayCompletes { get; set; }
         public int TodayPats { get; set; }
+        public int TodayPrompts { get; set; }
+        public int TodayTools { get; set; }
+        public string LastActiveDay { get; set; }  // 最近一次一起工作的日期
+        public int Streak { get; set; }            // 连续一起工作的天数
+        public int BestStreak { get; set; }
+        public string SummaryDay { get; set; }     // 哪天已经做过每日总结
+        public List<string> Achievements { get; set; }
 
-        public Stats() { FirstMet = DateTime.Now.ToString("yyyy-MM-dd"); Today = FirstMet; }
+        public Stats() { FirstMet = DateTime.Now.ToString("yyyy-MM-dd"); Today = FirstMet; LastActiveDay = ""; SummaryDay = ""; Achievements = new List<string>(); }
+
+        // 断了一天以上就不算连续了
+        public int CurrentStreak()
+        {
+            string today = DateTime.Now.ToString("yyyy-MM-dd"), yesterday = DateTime.Now.AddDays(-1).ToString("yyyy-MM-dd");
+            return LastActiveDay == today || LastActiveDay == yesterday ? Streak : 0;
+        }
+    }
+
+    // ---------------------------------------------------------------- 成就
+
+    static class Feats
+    {
+        public class Def
+        {
+            public string Id, Name, Desc;
+            public Func<Stats, bool> Done; // null 表示由事件直接触发
+            public Def(string id, string name, string desc, Func<Stats, bool> done) { Id = id; Name = name; Desc = desc; Done = done; }
+        }
+
+        public static readonly List<Def> All = new List<Def>
+        {
+            new Def("first_task", "初次合作", "一起完成第 1 个任务", x => x.Completes >= 1),
+            new Def("tasks_100", "百事通", "累计完成 100 个任务", x => x.Completes >= 100),
+            new Def("tasks_1000", "千锤百炼", "累计完成 1000 个任务", x => x.Completes >= 1000),
+            new Def("tools_1000", "工具达人", "累计调用工具 1000 次", x => x.Tools >= 1000),
+            new Def("day_20", "高效的一天", "一天之内完成 20 个任务", x => x.TodayCompletes >= 20),
+            new Def("streak_3", "三日之约", "连续 3 天一起工作", x => x.BestStreak >= 3),
+            new Def("streak_7", "一周相伴", "连续 7 天一起工作", x => x.BestStreak >= 7),
+            new Def("streak_30", "月光常在", "连续 30 天一起工作", x => x.BestStreak >= 30),
+            new Def("pats_100", "摸摸头", "摸头 100 次", x => x.Pats >= 100),
+            new Def("night_owl", "夜猫子", "凌晨 0–5 点完成一个任务", null),
+            new Def("early_bird", "早起的萤火", "早上 5–8 点完成一个任务", null),
+            new Def("marathon", "马拉松", "一个任务连续做了 30 分钟以上", null),
+        };
     }
 
     // ---------------------------------------------------------------- 成长
@@ -655,6 +727,17 @@ namespace FireflyPet
                 ? Text("所有内容都已解锁，谢谢你一直陪着她～", 13, FontWeights.Normal, Accent, 8)
                 : Text("下一个解锁：Lv." + nx + " —— " + Growth.PerkNames(nx) + "（还差 " + (Growth.TotalXp(nx) - stats.Xp) + " 经验）", 13, FontWeights.SemiBold, Accent, 8));
 
+            // 陪伴与成就
+            Body.Children.Add(Heading("陪伴与成就"));
+            var ach = new StackPanel();
+            var got = stats.Achievements ?? new List<string>();
+            ach.Children.Add(Text("连续一起工作 " + stats.CurrentStreak() + " 天 · 最长 " + stats.BestStreak + " 天 · 今天完成 " + stats.TodayCompletes + " 个任务、调用 " + stats.TodayTools + " 次工具", 12, FontWeights.Normal, Ink));
+            ach.Children.Add(Text("已解锁 " + Feats.All.Count(x => got.Contains(x.Id)) + " / " + Feats.All.Count + " 个成就", 12, FontWeights.SemiBold, Accent, 4));
+            foreach (var def in Feats.All)
+                ach.Children.Add(XpRow((got.Contains(def.Id) ? "★ " : "☆ ") + def.Name + " —— " + def.Desc, got.Contains(def.Id) ? "已达成" : "未达成"));
+            ach.Children.Add(Text("晚上 6 点后第一次摸头或把鼠标放到她身上，她会说说今天一起做了什么。", 11.5, FontWeights.Normal, Muted, 6));
+            Body.Children.Add(CardOf(ach));
+
             // 经验来源
             Body.Children.Add(Heading("怎么获得经验"));
             var xp = new StackPanel();
@@ -773,6 +856,8 @@ namespace FireflyPet
         public DateTime Last;
         public long StateTs;            // 最近一次改动状态的事件时间（毫秒）；异步 hook 可能晚到，更早的事件不再改状态
         public DateTime? PromptAt;      // 这一轮任务开始的时间，用来算耗时
+        public string Project = "";     // 项目文件夹名，多个会话同时进行时标在气泡前
+        public bool StuckWarned;        // 这次长时间没动静已经提醒过
     }
 
     // ---------------------------------------------------------------- 窗口
@@ -1020,7 +1105,7 @@ namespace FireflyPet
             // 精灵
             var spriteHost = new Grid { HorizontalAlignment = HorizontalAlignment.Center };
             sprite = new Image { Stretch = Stretch.Fill, Cursor = Cursors.Hand };
-            RenderOptions.SetBitmapScalingMode(sprite, BitmapScalingMode.HighQuality);
+            ApplyScaling();
             fx = new Canvas { IsHitTestVisible = false };
             spriteHost.Children.Add(sprite);
             spriteHost.Children.Add(fx);
@@ -1064,6 +1149,11 @@ namespace FireflyPet
         }
 
         HandbookWindow handbook;
+
+        void ApplyScaling()
+        {
+            RenderOptions.SetBitmapScalingMode(sprite, cfg.PixelSharp ? BitmapScalingMode.NearestNeighbor : BitmapScalingMode.HighQuality);
+        }
 
         void OpenHandbook()
         {
@@ -1150,6 +1240,7 @@ namespace FireflyPet
                 menu.Items.Add("退出", null, (s, e) => Close());
                 tray.ContextMenuStrip = menu;
                 tray.MouseClick += (s, e) => { if (e.Button == WF.MouseButtons.Left) ToggleVisible(); };
+                tray.BalloonTipClicked += (s, e) => { try { Desk.FocusClaude(); } catch { } };
             }
             catch (Exception e) { Program.Log("托盘图标失败: " + e.Message); }
         }
@@ -1207,6 +1298,14 @@ namespace FireflyPet
             var full = new MenuItem { Header = "全屏时自动隐藏", IsCheckable = true, IsChecked = cfg.HideInFullscreen };
             full.Click += (s, e) => { cfg.HideInFullscreen = !cfg.HideInFullscreen; SaveConfig(); };
             m.Items.Add(full);
+
+            var sharp = new MenuItem { Header = "像素清晰（边缘更锐利）", IsCheckable = true, IsChecked = cfg.PixelSharp };
+            sharp.Click += (s, e) => { cfg.PixelSharp = !cfg.PixelSharp; ApplyScaling(); SaveConfig(); };
+            m.Items.Add(sharp);
+
+            var notify = new MenuItem { Header = "系统通知（看不到我时提醒你）", IsCheckable = true, IsChecked = cfg.SystemNotify };
+            notify.Click += (s, e) => { cfg.SystemNotify = !cfg.SystemNotify; SaveConfig(); };
+            m.Items.Add(notify);
 
             var auto = new MenuItem { Header = "随 Claude Code 自动出现", IsCheckable = true, IsChecked = cfg.AutoStart };
             auto.Click += (s, e) => { cfg.AutoStart = !cfg.AutoStart; SaveConfig(); };
@@ -1331,6 +1430,101 @@ namespace FireflyPet
             return best;
         }
 
+        const int StuckMinutes = 10;
+
+        void RollDay()
+        {
+            string today = DateTime.Now.ToString("yyyy-MM-dd");
+            if (stats.Today == today) return;
+            stats.Today = today; stats.TodayCompletes = 0; stats.TodayPats = 0; stats.TodayPrompts = 0; stats.TodayTools = 0;
+            statsDirty = true;
+        }
+
+        // 同时有多个会话在忙时，在气泡前标出项目名
+        string ProjectTag(Session s)
+        {
+            if (string.IsNullOrEmpty(s.Project)) return "";
+            int active = sessions.Values.Count(x => (DateTime.Now - x.Last).TotalMinutes < 30);
+            return active > 1 ? "[" + s.Project + "] " : "";
+        }
+
+        // 看不到她（隐藏、被全屏挡住、人走开了）时，弹一个系统通知
+        DateTime lastNotify = DateTime.MinValue;
+        void Notify(string title, string text)
+        {
+            if (!cfg.SystemNotify || tray == null) return;
+            if (IsVisible && Desk.IdleSeconds() < 60) return;
+            if ((DateTime.Now - lastNotify).TotalSeconds < 5) return; // 授权请求和对应的通知会接连到达，只弹一次
+            lastNotify = DateTime.Now;
+            try { tray.ShowBalloonTip(6000, cfg.PetName + " · " + title, text, WF.ToolTipIcon.None); }
+            catch (Exception e) { Program.Log("系统通知失败: " + e.Message); }
+        }
+
+        // 连续一起工作的天数
+        void MarkActive(DateTime when)
+        {
+            string day = when.ToString("yyyy-MM-dd");
+            if (string.Compare(day, stats.LastActiveDay ?? "", StringComparison.Ordinal) <= 0) return;
+            stats.Streak = stats.LastActiveDay == when.AddDays(-1).ToString("yyyy-MM-dd") ? stats.Streak + 1 : 1;
+            stats.BestStreak = Math.Max(stats.BestStreak, stats.Streak);
+            stats.LastActiveDay = day;
+        }
+
+        void Unlock(string id, bool live)
+        {
+            if (stats.Achievements == null) stats.Achievements = new List<string>();
+            if (stats.Achievements.Contains(id)) return;
+            var def = Feats.All.FirstOrDefault(x => x.Id == id);
+            if (def == null) return;
+            stats.Achievements.Add(id);
+            statsDirty = true;
+            if (!live) return;
+            featQueue.Add(def); // 等当前气泡（比如"完成啦"）说完再宣布
+            if (handbook != null && handbook.IsVisible) handbook.Refresh();
+        }
+
+        readonly List<Feats.Def> featQueue = new List<Feats.Def>();
+
+        void AnnounceFeats()
+        {
+            if (featQueue.Count == 0 || bubbleSticky || DateTime.Now < bubbleUntil) return;
+            Overlay("jumping", 1);
+            Say(featQueue.Count == 1
+                ? "解锁成就「" + featQueue[0].Name + "」！" + featQueue[0].Desc + "～"
+                : "解锁成就" + string.Concat(featQueue.Select(x => "「" + x.Name + "」").ToArray()) + "！去成长手册看看吧～", 1, 5000, true);
+            featQueue.Clear();
+        }
+
+        void CheckFeats(bool live)
+        {
+            foreach (var def in Feats.All)
+                if (def.Done != null && def.Done(stats)) Unlock(def.Id, live);
+        }
+
+        // 晚上第一次互动时，说说今天一起做了什么
+        bool MaybeSummary()
+        {
+            string today = DateTime.Now.ToString("yyyy-MM-dd");
+            if (DateTime.Now.Hour < 18 || stats.SummaryDay == today || stats.TodayCompletes < 1) return false;
+            stats.SummaryDay = today; statsDirty = true;
+            int streak = stats.CurrentStreak();
+            Say("今天一起完成了 " + stats.TodayCompletes + " 个任务、调用了 " + stats.TodayTools + " 次工具" +
+                (streak >= 2 ? "，已经连续陪你 " + streak + " 天啦" : "") + "，辛苦啦～", 1, 7000, true);
+            return true;
+        }
+
+        // Claude Code 的通知原文是英文，常见的几句翻成中文
+        static string Zh(string msg)
+        {
+            if (string.IsNullOrEmpty(msg)) return msg;
+            var m = System.Text.RegularExpressions.Regex.Match(msg, @"^Claude needs your permission to use (.+?)\.?$");
+            if (m.Success) return "要用 " + m.Groups[1].Value + "，需要你点一下允许～";
+            if (msg.StartsWith("Claude is waiting for your input")) return "Claude 在等你回复～";
+            if (msg.StartsWith("Claude Code needs your attention") || msg.StartsWith("Claude needs your attention")) return "Claude 需要你看一下～";
+            if (msg.StartsWith("Claude Code login successful")) return "登录成功～";
+            return msg;
+        }
+
         void CheckStale(DateTime t)
         {
             foreach (var s in sessions.Values)
@@ -1340,8 +1534,18 @@ namespace FireflyPet
                     ((s.State == "running" || s.State == "waiting") && min > 60))
                     s.State = "idle";
             }
-            string today = t.ToString("yyyy-MM-dd");
-            if (stats.Today != today) { stats.Today = today; stats.TodayCompletes = 0; stats.TodayPats = 0; statsDirty = true; }
+            RollDay();
+            AnnounceFeats();
+            foreach (var kv in sessions)
+            {
+                var s = kv.Value;
+                if (s.State != "running" || s.StuckWarned || (t - s.Last).TotalMinutes < StuckMinutes) continue;
+                s.StuckWarned = true;
+                string msg = ProjectTag(s) + "已经 " + StuckMinutes + " 分钟没动静了，是在跑很久的命令，还是卡住了？去看看吧～";
+                Overlay("waiting", 1);
+                Say(msg, 1, 10000, true);
+                Notify("是不是卡住了？", msg);
+            }
             if (statsDirty) SaveStats();
         }
 
@@ -1439,7 +1643,7 @@ namespace FireflyPet
             hoverCooldown = DateTime.Now.AddSeconds(6);
             string b = BaseState();
             if ((b == "idle" || b == "review") && !overlay.HasValue) Overlay("jumping", 1);
-            if (!bubbleSticky && DateTime.Now >= bubbleUntil) Say(StatusLine(), 0, 2500, true);
+            if (!bubbleSticky && DateTime.Now >= bubbleUntil && !MaybeSummary()) Say(StatusLine(), 0, 2500, true);
         }
 
         void OnClick()
@@ -1447,12 +1651,14 @@ namespace FireflyPet
             string b = BaseState();
             if (b == "review" || b == "waiting")
             {
-                bool jumped = false;
-                try { jumped = Desk.FocusClaude(); } catch (Exception e) { Program.Log("切换到 Claude 失败: " + e.Message); }
+                int r = Desk.FocusNotFound;
+                try { r = Desk.FocusClaude(); } catch (Exception e) { Program.Log("切换到 Claude 失败: " + e.Message); }
+                bool jumped = r == Desk.FocusOk;
                 if (b == "review") foreach (var s in sessions.Values) if (s.State == "review") s.State = "idle";
                 Overlay("waving", 1);
                 bubbleSticky = false; // 你已经点过来了，"需要你确认"的常驻气泡可以收起
-                if (b == "review") Say(jumped ? "带你回去看看～" : "嗯，交给你检查啦～", 1, 2500, true);
+                if (r == Desk.FocusFlashed) Say("任务栏里闪的那个就是 Claude，点它过去吧～", 1, 4000, true);
+                else if (b == "review") Say(jumped ? "带你回去看看～" : "嗯，交给你检查啦～", 1, 2500, true);
                 else Say(jumped ? "就在这里，等你确认～" : "Claude 那边在等你确认哦～", 1, 2500, true);
                 return;
             }
@@ -1460,7 +1666,8 @@ namespace FireflyPet
             if (stats.TodayPats < Growth.PatsPerDay) { stats.TodayPats++; GainXp(Growth.XpPat, true); }
             statsDirty = true;
             Overlay("jumping", 1);
-            Say(Growth.RandomLine(Growth.Level(stats.Xp), rnd), 1, 3000, true);
+            if (!MaybeSummary()) Say(Growth.RandomLine(Growth.Level(stats.Xp), rnd), 1, 3000, true);
+            CheckFeats(true);
         }
 
         // ------------------------------------------------------------ 气泡
@@ -1566,6 +1773,10 @@ namespace FireflyPet
             if (fresh) s.StateTs = ts;
             bool recent = fresh && (DateTime.Now - when).TotalMinutes < 60;
             bool talk = live && fresh;
+            RollDay();
+            bool today = when.ToString("yyyy-MM-dd") == stats.Today;
+            if (Json.Str(d, "cwd") != "") s.Project = Json.Str(d, "cwd");
+            if (fresh) s.StuckWarned = false;
 
             switch (ev)
             {
@@ -1583,6 +1794,8 @@ namespace FireflyPet
                 }
                 case "UserPromptSubmit":
                     stats.Prompts++;
+                    if (today) stats.TodayPrompts++;
+                    MarkActive(when);
                     if (recent) s.State = "running";
                     if (fresh) s.PromptAt = when;
                     GainXp(Growth.XpPrompt, live);
@@ -1594,11 +1807,13 @@ namespace FireflyPet
                     break;
                 case "PostToolUse":
                     stats.Tools++;
+                    if (today) stats.TodayTools++;
                     if (recent) s.State = "running";
                     GainXp(Growth.XpTool, live);
                     break;
                 case "PostToolUseFailure":
                     stats.Tools++;
+                    if (today) stats.TodayTools++;
                     if (recent) s.State = "running";
                     if (talk && DateTime.Now > failOverlayCooldown)
                     {
@@ -1609,7 +1824,12 @@ namespace FireflyPet
                     break;
                 case "PermissionRequest":
                     if (recent) s.State = "waiting";
-                    if (talk) { Overlay("waving", 1); Say("需要你确认：" + ToolText(tool, detail), 2, 0); }
+                    if (talk)
+                    {
+                        Overlay("waving", 1);
+                        Say(ProjectTag(s) + "需要你确认：" + ToolText(tool, detail), 2, 0);
+                        Notify("需要你确认", ProjectTag(s) + ToolText(tool, detail));
+                    }
                     break;
                 case "Notification":
                 {
@@ -1617,13 +1837,15 @@ namespace FireflyPet
                     if (nt == "permission_prompt" || nt == "elicitation_dialog")
                     {
                         if (recent) s.State = "waiting";
-                        if (talk && !bubbleSticky) Say(Json.Str(d, "msg") == "" ? "需要你确认一下～" : Json.Str(d, "msg"), 2, 0);
+                        string text = ProjectTag(s) + (Json.Str(d, "msg") == "" ? "需要你确认一下～" : Zh(Json.Str(d, "msg")));
+                        if (talk && !bubbleSticky) Say(text, 2, 0);
+                        if (talk) Notify("需要你确认", text);
                     }
                     else if (nt == "idle_prompt")
                     {
                         if (recent && s.State == "idle") s.State = "review";
                     }
-                    else if (talk) Say(Json.Str(d, "msg"), 1, 3500);
+                    else if (talk) Say(ProjectTag(s) + Zh(Json.Str(d, "msg")), 1, 3500);
                     break;
                 }
                 case "SubagentStart":
@@ -1639,20 +1861,26 @@ namespace FireflyPet
                 case "Stop":
                 {
                     stats.Completes++;
-                    if (when.ToString("yyyy-MM-dd") == DateTime.Now.ToString("yyyy-MM-dd")) stats.TodayCompletes++;
+                    if (today) stats.TodayCompletes++;
+                    MarkActive(when);
+                    if (when.Hour < 5) Unlock("night_owl", live);
+                    else if (when.Hour >= 5 && when.Hour < 8) Unlock("early_bird", live);
                     if (recent) s.State = "review";
                     string took = "";
                     if (fresh && s.PromptAt.HasValue && when > s.PromptAt.Value)
                     {
                         var span = when - s.PromptAt.Value;
                         if (span.TotalSeconds >= 3) took = "（用了 " + Elapsed(span) + "）";
+                        if (span.TotalMinutes >= 30) Unlock("marathon", live);
                     }
                     if (fresh) s.PromptAt = null;
                     if (talk)
                     {
                         Overlay("jumping", 1);
                         string[] done = { "完成啦！来看看吧～", "做好了，要检查一下吗？", "搞定～等你验收哦。" };
-                        Say(done[rnd.Next(done.Length)] + took + "  +" + Growth.XpComplete + " XP", 1, 5000);
+                        string doneText = ProjectTag(s) + done[rnd.Next(done.Length)] + took;
+                        Say(doneText + "  +" + Growth.XpComplete + " XP", 1, 5000);
+                        Notify("任务完成", doneText);
                         if (Growth.Level(stats.Xp) >= Growth.FirefliesLevel) Fireflies(7);
                     }
                     GainXp(Growth.XpComplete, live);
@@ -1664,7 +1892,8 @@ namespace FireflyPet
                     if (talk)
                     {
                         string err = Json.Str(d, "error");
-                        Say("呜…请求失败了" + (err == "" ? "。" : "：" + err), 2, 6000);
+                        Say(ProjectTag(s) + "呜…请求失败了" + (err == "" ? "。" : "：" + err), 2, 6000);
+                        Notify("请求失败", ProjectTag(s) + (err == "" ? "请求失败了" : err));
                     }
                     break;
                 case "SessionEnd":
@@ -1674,6 +1903,7 @@ namespace FireflyPet
                     break;
             }
             statsDirty = true;
+            CheckFeats(live);
         }
 
         static string Elapsed(TimeSpan t)
