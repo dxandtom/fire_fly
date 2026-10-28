@@ -1,5 +1,5 @@
 {
-  "description": "把 Claude Code 的生命周期事件转给流萤桌宠（写入 ~/.claude/firefly-pet/events.jsonl），开会话或发消息时如果桌宠没在运行就把它启动。",
+  "description": "把 Claude Code 的生命周期事件转给流萤桌宠（写入 ~/.claude/firefly-pet/events.jsonl），开会话或发消息时如果桌宠没在运行就把它启动。工具调用等高频事件异步执行，不拖慢 Claude。",
   "hooks": {
     "SessionStart": [
       {
@@ -40,6 +40,7 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/FireflyPet.exe\" --hook",
+            "async": true,
             "timeout": 5
           }
         ],
@@ -52,6 +53,7 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/FireflyPet.exe\" --hook",
+            "async": true,
             "timeout": 5
           }
         ],
@@ -64,6 +66,7 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/FireflyPet.exe\" --hook",
+            "async": true,
             "timeout": 5
           }
         ],
@@ -88,6 +91,7 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/FireflyPet.exe\" --hook",
+            "async": true,
             "timeout": 5
           }
         ]
@@ -121,6 +125,7 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/FireflyPet.exe\" --hook",
+            "async": true,
             "timeout": 5
           }
         ]
@@ -132,6 +137,7 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/FireflyPet.exe\" --hook",
+            "async": true,
             "timeout": 5
           }
         ]
@@ -143,6 +149,7 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/FireflyPet.exe\" --hook",
+            "async": true,
             "timeout": 5
           }
         ]

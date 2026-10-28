@@ -159,19 +159,22 @@ namespace FireflyPet
         }
 
         // Claude 桌面端的主程序也叫 claude.exe；Claude Code CLI（含桌面端内置的那份）同名，按路径排除
-        public static bool ClaudeDesktopRunning()
+        public static bool ClaudeDesktopRunning() { return DesktopPids().Count > 0; }
+
+        public static HashSet<int> DesktopPids()
         {
+            var pids = new HashSet<int>();
             foreach (var p in Process.GetProcessesByName("claude"))
             {
                 try
                 {
                     string path = ImagePath(p.Id).ToLowerInvariant();
                     if (path.Length > 0 && !path.Contains("\\claude-code\\") && !path.Contains("\\.local\\") && !path.Contains("\\npm\\"))
-                        return true;
+                        pids.Add(p.Id);
                 }
                 finally { p.Dispose(); }
             }
-            return false;
+            return pids;
         }
 
         static string ImagePath(int pid)
@@ -190,6 +193,74 @@ namespace FireflyPet
         [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr h, int flags, StringBuilder sb, ref int size);
         [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    }
+
+    // ---------------------------------------------------------------- 窗口工具：跳回 Claude、全屏检测
+
+    static class Desk
+    {
+        // 把 Claude 桌面端的主窗口切到最前面；找不到窗口返回 false
+        public static bool FocusClaude()
+        {
+            var pids = Watcher.DesktopPids();
+            if (pids.Count == 0) return false;
+            IntPtr found = IntPtr.Zero;
+            EnumWindows((h, l) =>
+            {
+                int pid;
+                GetWindowThreadProcessId(h, out pid);
+                if (!pids.Contains(pid) || !IsWindowVisible(h) || GetWindow(h, GW_OWNER) != IntPtr.Zero || GetWindowTextLength(h) == 0) return true;
+                found = h;
+                return false;
+            }, IntPtr.Zero);
+            if (found == IntPtr.Zero) return false;
+            if (IsIconic(found)) ShowWindow(found, SW_RESTORE);
+            if (!SetForegroundWindow(found))
+            {
+                // 前台锁：模拟按一下 Alt 再试（常见做法，系统才允许切换前台）
+                keybd_event(VK_MENU, 0, 0, UIntPtr.Zero);
+                keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+                SetForegroundWindow(found);
+            }
+            return true;
+        }
+
+        // 前台窗口是否在 self 所在的显示器上全屏（桌面、任务栏本身不算）
+        public static bool ForegroundFullscreen(IntPtr self)
+        {
+            IntPtr fg = GetForegroundWindow();
+            if (fg == IntPtr.Zero || fg == self) return false;
+            var cls = new StringBuilder(64);
+            GetClassName(fg, cls, cls.Capacity);
+            string c = cls.ToString();
+            if (c == "Progman" || c == "WorkerW" || c == "Shell_TrayWnd" || c == "Shell_SecondaryTrayWnd") return false;
+            IntPtr mon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+            if (mon != MonitorFromWindow(self, MONITOR_DEFAULTTONEAREST)) return false;
+            var mi = new MONITORINFO { cbSize = Marshal.SizeOf(typeof(MONITORINFO)) };
+            RECT r;
+            if (!GetMonitorInfo(mon, ref mi) || !GetWindowRect(fg, out r)) return false;
+            return r.Left <= mi.Monitor.Left && r.Top <= mi.Monitor.Top && r.Right >= mi.Monitor.Right && r.Bottom >= mi.Monitor.Bottom;
+        }
+
+        [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
+        [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public int cbSize; public RECT Monitor, Work; public int Flags; }
+        delegate bool EnumProc(IntPtr h, IntPtr l);
+        const int GW_OWNER = 4, SW_RESTORE = 9, MONITOR_DEFAULTTONEAREST = 2, KEYEVENTF_KEYUP = 2;
+        const byte VK_MENU = 0x12;
+        [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr l);
+        [DllImport("user32.dll")] static extern int GetWindowThreadProcessId(IntPtr h, out int pid);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+        [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, int cmd);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextLength(IntPtr h);
+        [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+        [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+        [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
+        [DllImport("user32.dll")] static extern void keybd_event(byte vk, byte scan, int flags, UIntPtr extra);
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder sb, int max);
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, int flags);
+        [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr mon, ref MONITORINFO mi);
+        [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
     }
 
     // ---------------------------------------------------------------- Claude Code hook
@@ -252,6 +323,24 @@ namespace FireflyPet
             }
         }
 
+        // 桌宠没在运行时没人取走事件，文件会一直变大；超过上限就只留最近的一段
+        const long MaxEventsBytes = 1024 * 1024, KeepEventsBytes = 128 * 1024;
+
+        static void TrimEvents(string file)
+        {
+            using (var fs = new FileStream(file, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+            {
+                if (fs.Length <= MaxEventsBytes) return;
+                var tail = new byte[KeepEventsBytes];
+                fs.Seek(-KeepEventsBytes, SeekOrigin.End);
+                int n = 0, r;
+                while (n < tail.Length && (r = fs.Read(tail, n, tail.Length - n)) > 0) n += r;
+                int start = Array.IndexOf(tail, (byte)'\n', 0, n) + 1; // 从完整的一行开始
+                fs.SetLength(0);
+                fs.Write(tail, start, n - start);
+            }
+        }
+
         static void Handle(string raw)
         {
             var d = Json.Parse(string.IsNullOrEmpty(raw) ? "{}" : raw) ?? new Dictionary<string, object>();
@@ -283,6 +372,8 @@ namespace FireflyPet
 
             string line = Json.S.Serialize(rec) + "\n";
             string file = System.IO.Path.Combine(Program.DataDir, "events.jsonl");
+            try { if (new FileInfo(file).Length > MaxEventsBytes) TrimEvents(file); }
+            catch (Exception e) { if (!(e is FileNotFoundException)) Program.Log("裁剪事件文件失败: " + e.Message); }
             for (int i = 0; i < 10; i++) // 桌宠正把文件改名取走时会短暂占用
             {
                 try { File.AppendAllText(file, line, new UTF8Encoding(false)); break; }
@@ -386,12 +477,13 @@ namespace FireflyPet
         public string Bubbles { get; set; }      // all / brief / off
         public bool LookAtCursor { get; set; }
         public bool Wander { get; set; }
+        public bool HideInFullscreen { get; set; } // 前台全屏（看视频、演示、游戏）时自动隐藏
         public string Spritesheet { get; set; }
         public string PetName { get; set; }
 
         public Config()
         {
-            Scale = 0.7; AutoStart = true; FollowClaude = true; Bubbles = "all"; LookAtCursor = true;
+            Scale = 0.7; AutoStart = true; FollowClaude = true; Bubbles = "all"; LookAtCursor = true; HideInFullscreen = true;
             Spritesheet = "firefly-spritesheet.png"; PetName = "流萤";
         }
     }
@@ -679,6 +771,8 @@ namespace FireflyPet
     {
         public string State = "idle";
         public DateTime Last;
+        public long StateTs;            // 最近一次改动状态的事件时间（毫秒）；异步 hook 可能晚到，更早的事件不再改状态
+        public DateTime? PromptAt;      // 这一轮任务开始的时间，用来算耗时
     }
 
     // ---------------------------------------------------------------- 窗口
@@ -711,6 +805,7 @@ namespace FireflyPet
         readonly Stats stats;
         readonly Random rnd = new Random();
         readonly Dictionary<string, Session> sessions = new Dictionary<string, Session>();
+        readonly HashSet<string> endedSessions = new HashSet<string>(); // 已结束的会话，晚到的异步事件不再让它复活
         BitmapSource[,] frames;
 
         // 视图
@@ -835,10 +930,24 @@ namespace FireflyPet
                 else if (sawClaude && cfg.FollowClaude && ++claudeGone >= 2) Close();
             };
             follow.Start();
+
+            var fullscreen = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+            fullscreen.Tick += (s, e) => CheckFullscreen();
+            fullscreen.Start();
         }
 
         bool sawClaude;
         int claudeGone;
+        bool autoHidden; // 因为全屏被自动藏起来（用户手动隐藏的不算）
+
+        void CheckFullscreen()
+        {
+            bool full = false;
+            try { full = cfg.HideInFullscreen && Desk.ForegroundFullscreen(new WindowInteropHelper(this).Handle); }
+            catch (Exception e) { Program.Log("全屏检测失败: " + e.Message); }
+            if (full && IsVisible && !dragging) { autoHidden = true; Hide(); }
+            else if (!full && autoHidden) { autoHidden = false; Show(); Topmost = false; Topmost = true; }
+        }
 
         // ------------------------------------------------------------ 构建
 
@@ -1047,6 +1156,7 @@ namespace FireflyPet
 
         void ToggleVisible()
         {
+            autoHidden = false;
             if (IsVisible) Hide(); else { Show(); Topmost = false; Topmost = true; }
         }
 
@@ -1093,6 +1203,10 @@ namespace FireflyPet
             var wander = new MenuItem { Header = canWander ? "散步模式" : "散步模式（Lv." + Growth.WanderLevel + " 解锁）", IsCheckable = true, IsChecked = cfg.Wander && canWander, IsEnabled = canWander };
             wander.Click += (s, e) => { cfg.Wander = !cfg.Wander; SaveConfig(); };
             m.Items.Add(wander);
+
+            var full = new MenuItem { Header = "全屏时自动隐藏", IsCheckable = true, IsChecked = cfg.HideInFullscreen };
+            full.Click += (s, e) => { cfg.HideInFullscreen = !cfg.HideInFullscreen; SaveConfig(); };
+            m.Items.Add(full);
 
             var auto = new MenuItem { Header = "随 Claude Code 自动出现", IsCheckable = true, IsChecked = cfg.AutoStart };
             auto.Click += (s, e) => { cfg.AutoStart = !cfg.AutoStart; SaveConfig(); };
@@ -1330,11 +1444,16 @@ namespace FireflyPet
 
         void OnClick()
         {
-            if (BaseState() == "review")
+            string b = BaseState();
+            if (b == "review" || b == "waiting")
             {
-                foreach (var s in sessions.Values) if (s.State == "review") s.State = "idle";
+                bool jumped = false;
+                try { jumped = Desk.FocusClaude(); } catch (Exception e) { Program.Log("切换到 Claude 失败: " + e.Message); }
+                if (b == "review") foreach (var s in sessions.Values) if (s.State == "review") s.State = "idle";
                 Overlay("waving", 1);
-                Say("嗯，交给你检查啦～", 1, 2500, true);
+                bubbleSticky = false; // 你已经点过来了，"需要你确认"的常驻气泡可以收起
+                if (b == "review") Say(jumped ? "带你回去看看～" : "嗯，交给你检查啦～", 1, 2500, true);
+                else Say(jumped ? "就在这里，等你确认～" : "Claude 那边在等你确认哦～", 1, 2500, true);
                 return;
             }
             stats.Pats++;
@@ -1414,11 +1533,16 @@ namespace FireflyPet
                 string text = File.ReadAllText(processingFile, Encoding.UTF8);
                 File.Delete(processingFile);
                 long nowMs = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+                var batch = new List<Dictionary<string, object>>();
                 foreach (var line in text.Split('\n'))
                 {
                     if (line.Trim().Length == 0) continue;
-                    var d = Json.Parse(line);
-                    if (d == null) continue;
+                    var d = Json.Parse(line); // 半行（裁剪时留下的）解析失败会得到 null
+                    if (d != null) batch.Add(d);
+                }
+                // 异步 hook 写入顺序不一定等于发生顺序，按事件时间排一下（OrderBy 是稳定排序）
+                foreach (var d in batch.OrderBy(x => Json.Num(x, "ts")))
+                {
                     long ts = Json.Num(d, "ts");
                     Apply(d, ts, nowMs - ts < 4000);
                 }
@@ -1432,10 +1556,16 @@ namespace FireflyPet
         {
             string ev = Json.Str(d, "ev"), sid = Json.Str(d, "sid"), tool = Json.Str(d, "tool"), detail = Json.Str(d, "detail");
             DateTime when = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddMilliseconds(ts).ToLocalTime();
+            if (ev == "SessionStart") endedSessions.Remove(sid);
+            bool ended = endedSessions.Contains(sid);
             Session s;
-            if (!sessions.TryGetValue(sid, out s)) { s = new Session { Last = when }; sessions[sid] = s; }
+            if (!sessions.TryGetValue(sid, out s)) { s = new Session { Last = when }; if (!ended) sessions[sid] = s; }
             if (when > s.Last) s.Last = when;
-            bool recent = (DateTime.Now - when).TotalMinutes < 60;
+            // 异步 hook 可能晚到：比这个会话已处理过的事件更早的，只记统计和经验，不改状态、不说话
+            bool fresh = !ended && ts >= s.StateTs;
+            if (fresh) s.StateTs = ts;
+            bool recent = fresh && (DateTime.Now - when).TotalMinutes < 60;
+            bool talk = live && fresh;
 
             switch (ev)
             {
@@ -1444,7 +1574,7 @@ namespace FireflyPet
                     string src = Json.Str(d, "source");
                     if (src == "startup") stats.Sessions++;
                     if (recent) s.State = "idle";
-                    if (live && src != "compact")
+                    if (talk && src != "compact")
                     {
                         Overlay("waving", 2);
                         Say(src == "resume" ? "欢迎回来，我们继续吧。" : src == "clear" ? "好，从头开始～" : Greeting(), 1, 3500);
@@ -1454,12 +1584,13 @@ namespace FireflyPet
                 case "UserPromptSubmit":
                     stats.Prompts++;
                     if (recent) s.State = "running";
+                    if (fresh) s.PromptAt = when;
                     GainXp(Growth.XpPrompt, live);
-                    if (live) Say("收到～让我想想…", 1, 2500);
+                    if (talk) Say("收到～让我想想…", 1, 2500);
                     break;
                 case "PreToolUse":
                     if (recent) s.State = "running";
-                    if (live) Say(ToolText(tool, detail), 0, 3000);
+                    if (talk) Say(ToolText(tool, detail), 0, 3000);
                     break;
                 case "PostToolUse":
                     stats.Tools++;
@@ -1469,7 +1600,7 @@ namespace FireflyPet
                 case "PostToolUseFailure":
                     stats.Tools++;
                     if (recent) s.State = "running";
-                    if (live && DateTime.Now > failOverlayCooldown)
+                    if (talk && DateTime.Now > failOverlayCooldown)
                     {
                         failOverlayCooldown = DateTime.Now.AddSeconds(10);
                         Overlay("failed", 1);
@@ -1478,7 +1609,7 @@ namespace FireflyPet
                     break;
                 case "PermissionRequest":
                     if (recent) s.State = "waiting";
-                    if (live) { Overlay("waving", 1); Say("需要你确认：" + ToolText(tool, detail), 2, 0); }
+                    if (talk) { Overlay("waving", 1); Say("需要你确认：" + ToolText(tool, detail), 2, 0); }
                     break;
                 case "Notification":
                 {
@@ -1486,13 +1617,13 @@ namespace FireflyPet
                     if (nt == "permission_prompt" || nt == "elicitation_dialog")
                     {
                         if (recent) s.State = "waiting";
-                        if (live && !bubbleSticky) Say(Json.Str(d, "msg") == "" ? "需要你确认一下～" : Json.Str(d, "msg"), 2, 0);
+                        if (talk && !bubbleSticky) Say(Json.Str(d, "msg") == "" ? "需要你确认一下～" : Json.Str(d, "msg"), 2, 0);
                     }
                     else if (nt == "idle_prompt")
                     {
                         if (recent && s.State == "idle") s.State = "review";
                     }
-                    else if (live) Say(Json.Str(d, "msg"), 1, 3500);
+                    else if (talk) Say(Json.Str(d, "msg"), 1, 3500);
                     break;
                 }
                 case "SubagentStart":
@@ -1503,18 +1634,25 @@ namespace FireflyPet
                     break;
                 case "PreCompact":
                     if (recent) s.State = "running";
-                    if (live) Say("整理一下记忆…", 1, 3000);
+                    if (talk) Say("整理一下记忆…", 1, 3000);
                     break;
                 case "Stop":
                 {
                     stats.Completes++;
                     if (when.ToString("yyyy-MM-dd") == DateTime.Now.ToString("yyyy-MM-dd")) stats.TodayCompletes++;
                     if (recent) s.State = "review";
-                    if (live)
+                    string took = "";
+                    if (fresh && s.PromptAt.HasValue && when > s.PromptAt.Value)
+                    {
+                        var span = when - s.PromptAt.Value;
+                        if (span.TotalSeconds >= 3) took = "（用了 " + Elapsed(span) + "）";
+                    }
+                    if (fresh) s.PromptAt = null;
+                    if (talk)
                     {
                         Overlay("jumping", 1);
                         string[] done = { "完成啦！来看看吧～", "做好了，要检查一下吗？", "搞定～等你验收哦。" };
-                        Say(done[rnd.Next(done.Length)] + "  +" + Growth.XpComplete + " XP", 1, 5000);
+                        Say(done[rnd.Next(done.Length)] + took + "  +" + Growth.XpComplete + " XP", 1, 5000);
                         if (Growth.Level(stats.Xp) >= Growth.FirefliesLevel) Fireflies(7);
                     }
                     GainXp(Growth.XpComplete, live);
@@ -1523,7 +1661,7 @@ namespace FireflyPet
                 case "StopFailure":
                     stats.Failures++;
                     if (recent) s.State = "failed";
-                    if (live)
+                    if (talk)
                     {
                         string err = Json.Str(d, "error");
                         Say("呜…请求失败了" + (err == "" ? "。" : "：" + err), 2, 6000);
@@ -1531,10 +1669,18 @@ namespace FireflyPet
                     break;
                 case "SessionEnd":
                     sessions.Remove(sid);
-                    if (live) { Overlay("waving", 1); Say("下次见～", 1, 2500); }
+                    endedSessions.Add(sid);
+                    if (talk) { Overlay("waving", 1); Say("下次见～", 1, 2500); }
                     break;
             }
             statsDirty = true;
+        }
+
+        static string Elapsed(TimeSpan t)
+        {
+            if (t.TotalHours >= 1) return (int)t.TotalHours + " 小时 " + t.Minutes + " 分";
+            if (t.TotalMinutes >= 1) return (int)t.TotalMinutes + " 分 " + t.Seconds + " 秒";
+            return (int)t.TotalSeconds + " 秒";
         }
 
         void GainXp(int amount, bool live)
