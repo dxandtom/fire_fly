@@ -33,6 +33,7 @@ namespace FireflyPet
         public static string DataDir;
         public static string AppDir;
         public static string SnapDir;   // 调试用：定时把窗口内容渲染成 PNG
+        public static bool HandbookOnStart; // 调试用：启动即打开成长手册（配合 --snap 截图）
 
         public const string PetMutex = "Local\\FireflyClaudePet";
 
@@ -49,6 +50,7 @@ namespace FireflyPet
                 else if (args[i] == "--demo") demo = true;
                 else if (args[i] == "--watch") watch = true;
                 else if (args[i] == "--hook") hook = true;
+                else if (args[i] == "--handbook") HandbookOnStart = true;
             }
             Directory.CreateDirectory(DataDir);
             if (hook) return Hook.Run();
@@ -428,6 +430,12 @@ namespace FireflyPet
 
         public static int Level(long xp) { long a, b; return Level(xp, out a, out b); }
 
+        // 到达第 n 级需要的累计经验
+        public static long TotalXp(int level) { return 40L * (level - 1) + 10L * (level - 1) * (level - 2); }
+
+        // 各行为给的经验（事件处理和成长手册共用）
+        public const int XpComplete = 10, XpPrompt = 3, XpSubagent = 2, XpTool = 1, XpPat = 1, PatsPerDay = 20;
+
         static readonly int[] TitleAt = { 1, 3, 6, 10, 15, 20, 30 };
         static readonly string[] Titles = { "初遇的萤火", "小小同行者", "默契搭档", "可靠的伙伴", "萤火守望者", "燃烧的萤火", "永不熄灭的萤火" };
 
@@ -441,14 +449,49 @@ namespace FireflyPet
         public const int WanderLevel = 5;
         public const int FirefliesLevel = 8;
 
+        public class Perk
+        {
+            public int Level; public string Name, Desc; public bool IsTitle;
+            public Perk(int lv, string name, string desc, bool title) { Level = lv; Name = name; Desc = desc; IsTitle = title; }
+        }
+
+        // 随等级到来的功能与外观；称号另见 Titles。升级气泡、右键菜单、成长手册都从这里取
+        static readonly Perk[] Features =
+        {
+            new Perk(3, "更多悄悄话", "摸头时她会说的话变多。", false),
+            new Perk(WanderLevel, "散步模式", "空闲时在屏幕底部左右溜达，有任务时自动停下。需在右键菜单勾选「散步模式」开启。", false),
+            new Perk(WanderLevel, "青绿色徽章", "脚下的等级徽章变成青绿色。", false),
+            new Perk(6, "更多悄悄话", "又多了一组台词。", false),
+            new Perk(FirefliesLevel, "萤火特效", "每次 Claude 完成任务时，身边飘起萤火。自动生效。", false),
+            new Perk(10, "更多悄悄话", "最后一组台词。", false),
+            new Perk(10, "金色徽章", "等级徽章变成金色。", false),
+            new Perk(20, "粉色徽章", "等级徽章变成粉色。", false),
+        };
+
+        public static List<Perk> AllPerks()
+        {
+            var all = new List<Perk>();
+            for (int i = 0; i < TitleAt.Length; i++) all.Add(new Perk(TitleAt[i], "称号「" + Titles[i] + "」", "", true));
+            all.AddRange(Features);
+            return all.OrderBy(p => p.Level).ThenBy(p => p.IsTitle ? 0 : 1).ToList();
+        }
+
+        public static List<Perk> PerksAt(int lv) { return AllPerks().Where(p => p.Level == lv).ToList(); }
+
+        // 当前等级之后、最近一个有新东西的等级；没有了返回 0
+        public static int NextPerkLevel(int lv)
+        {
+            var next = AllPerks().Where(p => p.Level > lv).ToList();
+            return next.Count == 0 ? 0 : next[0].Level;
+        }
+
+        public static string PerkNames(int lv) { return string.Join("、", PerksAt(lv).Select(p => p.Name).ToArray()); }
+
+        // 升级气泡里的解锁提示（称号已在气泡第一行显示，这里只列功能）
         public static string Unlock(int lv)
         {
-            if (lv == 3) return "解锁：更多悄悄话";
-            if (lv == WanderLevel) return "解锁：散步模式（右键开启）";
-            if (lv == 6) return "解锁：更多悄悄话";
-            if (lv == FirefliesLevel) return "解锁：完成任务时的萤火特效";
-            if (lv == 10) return "解锁：更多悄悄话";
-            return null;
+            var f = Features.Where(p => p.Level == lv).Select(p => p.Level == WanderLevel && p.Name == "散步模式" ? "散步模式（右键开启）" : p.Name).ToArray();
+            return f.Length == 0 ? null : "解锁：" + string.Join("、", f);
         }
 
         public static Color TierColor(int lv)
@@ -473,6 +516,153 @@ namespace FireflyPet
             var pool = new List<string>();
             for (int i = 0; i < tiers; i++) pool.AddRange(Lines[i]);
             return pool[rnd.Next(pool.Count)];
+        }
+    }
+
+    // ---------------------------------------------------------------- 成长手册
+
+    // 等级、解锁内容、经验来源的说明窗口。右键菜单 / 托盘菜单 / 点击脚下徽章打开
+    public class HandbookWindow : Window
+    {
+        static readonly Brush Ink = new SolidColorBrush(Color.FromRgb(0x2B, 0x33, 0x3A));
+        static readonly Brush Muted = new SolidColorBrush(Color.FromRgb(0x7A, 0x86, 0x8C));
+        static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(0x3F, 0xB8, 0x9C));
+        static readonly Brush Card = Brushes.White;
+        static readonly Brush Line = new SolidColorBrush(Color.FromRgb(0xE3, 0xEA, 0xE8));
+
+        readonly Stats stats;
+        readonly string petName;
+        public readonly StackPanel Body;
+
+        public HandbookWindow(Stats st, string name)
+        {
+            stats = st; petName = name;
+            Title = name + "成长手册";
+            Width = 500; Height = 680;
+            WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            Background = new SolidColorBrush(Color.FromRgb(0xF4, 0xF8, 0xF7));
+            FontFamily = new FontFamily("Microsoft YaHei UI");
+            Foreground = Ink;
+            Body = new StackPanel { Margin = new Thickness(22, 18, 22, 22) };
+            Content = new ScrollViewer { Content = Body, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+            Refresh();
+        }
+
+        public void Refresh()
+        {
+            Body.Children.Clear();
+            long into, need;
+            int lv = Growth.Level(stats.Xp, out into, out need);
+
+            // 当前进度
+            Body.Children.Add(Text(petName + " · Lv." + lv + "「" + Growth.Title(lv) + "」", 18, FontWeights.Bold, Ink));
+            Body.Children.Add(Text("本级 " + into + " / " + need + " 经验 · 累计 " + stats.Xp + " 经验", 12, FontWeights.Normal, Muted, 2));
+            Body.Children.Add(Bar(into, need));
+            int nx = Growth.NextPerkLevel(lv);
+            Body.Children.Add(nx == 0
+                ? Text("所有内容都已解锁，谢谢你一直陪着她～", 13, FontWeights.Normal, Accent, 8)
+                : Text("下一个解锁：Lv." + nx + " —— " + Growth.PerkNames(nx) + "（还差 " + (Growth.TotalXp(nx) - stats.Xp) + " 经验）", 13, FontWeights.SemiBold, Accent, 8));
+
+            // 经验来源
+            Body.Children.Add(Heading("怎么获得经验"));
+            var xp = new StackPanel();
+            xp.Children.Add(XpRow("Claude 完成一次回复", "+" + Growth.XpComplete));
+            xp.Children.Add(XpRow("你发一条消息", "+" + Growth.XpPrompt));
+            xp.Children.Add(XpRow("子代理（subagent）完成一次", "+" + Growth.XpSubagent));
+            xp.Children.Add(XpRow("工具调用成功一次", "+" + Growth.XpTool));
+            xp.Children.Add(XpRow("摸头（点她一下）", "+" + Growth.XpPat + "，每天最多 " + Growth.PatsPerDay + " 次"));
+            xp.Children.Add(Text("出错、等你授权、开会话不加经验。桌宠没开时发生的事件会在下次启动时补算。", 11.5, FontWeights.Normal, Muted, 6));
+            Body.Children.Add(CardOf(xp));
+
+            // 等级与解锁
+            Body.Children.Add(Heading("等级与解锁"));
+            foreach (int level in Growth.AllPerks().Select(p => p.Level).Distinct())
+                Body.Children.Add(LevelCard(level, lv));
+
+            // 徽章
+            Body.Children.Add(Heading("脚下的等级徽章"));
+            var bp = new StackPanel();
+            bp.Children.Add(Text("就是她脚下写着「Lv.x」的小标签，下面的细条是本级经验进度；点它也能打开这本手册。颜色随等级变化：", 12, FontWeights.Normal, Ink));
+            var row = new WrapPanel { Margin = new Thickness(0, 8, 0, 0) };
+            foreach (var t in new[] { new KeyValuePair<int, string>(1, "Lv.1–4"), new KeyValuePair<int, string>(5, "Lv.5–9"), new KeyValuePair<int, string>(10, "Lv.10–19"), new KeyValuePair<int, string>(20, "Lv.20+") })
+                row.Children.Add(Badge(t.Key, t.Value));
+            bp.Children.Add(row);
+            Body.Children.Add(CardOf(bp));
+        }
+
+        UIElement LevelCard(int level, int cur)
+        {
+            bool open = cur >= level;
+            var sp = new StackPanel();
+            var head = new DockPanel { LastChildFill = false, Margin = new Thickness(0, 0, 0, 4) };
+            var lvText = Text("Lv." + level, 15, FontWeights.Bold, open ? Ink : Muted);
+            var total = Text("  累计 " + Growth.TotalXp(level) + " 经验", 11.5, FontWeights.Normal, Muted);
+            total.VerticalAlignment = VerticalAlignment.Bottom;
+            total.Margin = new Thickness(0, 0, 0, 2);
+            DockPanel.SetDock(lvText, Dock.Left); DockPanel.SetDock(total, Dock.Left);
+            head.Children.Add(lvText); head.Children.Add(total);
+            var chip = new Border
+            {
+                CornerRadius = new CornerRadius(9), Padding = new Thickness(8, 1, 8, 2),
+                Background = open ? new SolidColorBrush(Color.FromRgb(0xDD, 0xF5, 0xEE)) : new SolidColorBrush(Color.FromRgb(0xEE, 0xF1, 0xF2)),
+                Child = Text(open ? "✓ 已解锁" : "还差 " + (Growth.TotalXp(level) - stats.Xp) + " 经验", 11.5, FontWeights.SemiBold, open ? Accent : Muted),
+            };
+            DockPanel.SetDock(chip, Dock.Right);
+            head.Children.Add(chip);
+            sp.Children.Add(head);
+            foreach (var p in Growth.PerksAt(level))
+            {
+                var name = Text("· " + p.Name, 13, p.IsTitle ? FontWeights.Normal : FontWeights.SemiBold, open ? Ink : Muted, 2);
+                sp.Children.Add(name);
+                if (p.Desc != "") sp.Children.Add(Text(p.Desc, 11.5, FontWeights.Normal, Muted, 0, 12));
+            }
+            var c = CardOf(sp);
+            if (!open) c.Opacity = 0.85;
+            return c;
+        }
+
+        static TextBlock Text(string s, double size, FontWeight w, Brush fg, double top = 0, double left = 0)
+        {
+            return new TextBlock { Text = s, FontSize = size, FontWeight = w, Foreground = fg, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(left, top, 0, 0) };
+        }
+
+        static TextBlock Heading(string s) { return Text(s, 14, FontWeights.Bold, Ink, 20); }
+
+        static Border CardOf(UIElement child)
+        {
+            return new Border { Child = child, Background = Card, BorderBrush = Line, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(12, 9, 12, 10), Margin = new Thickness(0, 8, 0, 0) };
+        }
+
+        static UIElement XpRow(string what, string amount)
+        {
+            var g = new DockPanel { Margin = new Thickness(0, 2, 0, 2) };
+            var a = Text(amount, 13, FontWeights.Bold, Accent);
+            DockPanel.SetDock(a, Dock.Right);
+            g.Children.Add(a);
+            g.Children.Add(Text(what, 13, FontWeights.Normal, Ink));
+            return g;
+        }
+
+        static UIElement Bar(long into, long need)
+        {
+            var g = new Grid { Height = 6, Margin = new Thickness(0, 6, 0, 0) };
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(Math.Max(into, 0.001), GridUnitType.Star) });
+            g.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(Math.Max(need - into, 0.001), GridUnitType.Star) });
+            var bg = new Border { Background = Line, CornerRadius = new CornerRadius(3) };
+            Grid.SetColumnSpan(bg, 2);
+            g.Children.Add(bg);
+            g.Children.Add(new Border { Background = Accent, CornerRadius = new CornerRadius(3) });
+            return g;
+        }
+
+        // 和桌宠脚下一样的徽章样式
+        static UIElement Badge(int lv, string label)
+        {
+            var col = new SolidColorBrush(Growth.TierColor(lv));
+            var sp = new StackPanel();
+            sp.Children.Add(new TextBlock { Text = label, FontSize = 11, FontWeight = FontWeights.Bold, Foreground = col, HorizontalAlignment = HorizontalAlignment.Center });
+            sp.Children.Add(new Border { Height = 2.5, Width = 44, Background = col, Margin = new Thickness(0, 1, 0, 1) });
+            return new Border { Child = sp, Background = new SolidColorBrush(Color.FromArgb(0xE0, 0x1E, 0x26, 0x2C)), CornerRadius = new CornerRadius(7), Padding = new Thickness(8, 1, 8, 2), Margin = new Thickness(0, 0, 8, 0) };
         }
     }
 
@@ -617,6 +807,16 @@ namespace FireflyPet
                 nextWander = DateTime.Now.AddSeconds(20 + rnd.Next(30));
                 if (demoMode) RunDemo();
                 if (Program.SnapDir != null) StartSnapshots();
+                if (Program.HandbookOnStart)
+                {
+                    OpenHandbook();
+                    if (Program.SnapDir != null)
+                    {
+                        var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1200) };
+                        t.Tick += (s2, e2) => { t.Stop(); SnapElement(handbook.Body, "handbook.png"); };
+                        t.Start();
+                    }
+                }
             };
             Closed += (s, e) => { SaveStats(); if (tray != null) { tray.Visible = false; tray.Dispose(); } };
 
@@ -746,8 +946,23 @@ namespace FireflyPet
             Grid.SetRow(badge, 2);
             root.Children.Add(badge);
             UpdateBadge();
+            badge.IsHitTestVisible = true;
+            badge.Cursor = Cursors.Hand;
+            badge.ToolTip = "点我打开成长手册";
+            badge.MouseLeftButtonUp += (s, e) => { OpenHandbook(); e.Handled = true; };
 
             Content = root;
+        }
+
+        HandbookWindow handbook;
+
+        void OpenHandbook()
+        {
+            if (handbook != null) { handbook.Refresh(); handbook.Activate(); return; }
+            handbook = new HandbookWindow(stats, cfg.PetName);
+            handbook.Closed += (s, e) => handbook = null;
+            handbook.Show();
+            handbook.Activate();
         }
 
         void ApplyScale(double s, bool keepFeet)
@@ -820,6 +1035,7 @@ namespace FireflyPet
                 var menu = new WF.ContextMenuStrip();
                 menu.Items.Add("显示 / 隐藏", null, (s, e) => ToggleVisible());
                 menu.Items.Add("回到右下角", null, (s, e) => { Show(); ResetPosition(); });
+                menu.Items.Add("成长手册…", null, (s, e) => OpenHandbook());
                 menu.Items.Add("演示全部动作", null, (s, e) => { Show(); RunDemo(); });
                 menu.Items.Add("-");
                 menu.Items.Add("退出", null, (s, e) => Close());
@@ -842,6 +1058,11 @@ namespace FireflyPet
             m.Items.Add(new MenuItem { Header = cfg.PetName + " · Lv." + lv + "「" + Growth.Title(lv) + "」", IsEnabled = false });
             m.Items.Add(new MenuItem { Header = "经验 " + into + " / " + need + "   今日完成 " + stats.TodayCompletes + " 次", IsEnabled = false });
             m.Items.Add(new MenuItem { Header = "累计：对话 " + stats.Prompts + " · 工具 " + stats.Tools + " · 完成 " + stats.Completes, IsEnabled = false });
+            int nx = Growth.NextPerkLevel(lv);
+            m.Items.Add(new MenuItem { Header = nx == 0 ? "所有内容都已解锁" : "下一个解锁：Lv." + nx + " " + Growth.PerkNames(nx) + "（还差 " + (Growth.TotalXp(nx) - stats.Xp) + " 经验）", IsEnabled = false });
+            var book = new MenuItem { Header = "成长手册（等级、解锁、经验怎么来）…", FontWeight = FontWeights.Bold };
+            book.Click += (s, e) => OpenHandbook();
+            m.Items.Add(book);
             m.Items.Add(new Separator());
 
             var size = new MenuItem { Header = "大小" };
@@ -1117,7 +1338,7 @@ namespace FireflyPet
                 return;
             }
             stats.Pats++;
-            if (stats.TodayPats < 20) { stats.TodayPats++; GainXp(1, true); }
+            if (stats.TodayPats < Growth.PatsPerDay) { stats.TodayPats++; GainXp(Growth.XpPat, true); }
             statsDirty = true;
             Overlay("jumping", 1);
             Say(Growth.RandomLine(Growth.Level(stats.Xp), rnd), 1, 3000, true);
@@ -1233,7 +1454,7 @@ namespace FireflyPet
                 case "UserPromptSubmit":
                     stats.Prompts++;
                     if (recent) s.State = "running";
-                    GainXp(3, live);
+                    GainXp(Growth.XpPrompt, live);
                     if (live) Say("收到～让我想想…", 1, 2500);
                     break;
                 case "PreToolUse":
@@ -1243,7 +1464,7 @@ namespace FireflyPet
                 case "PostToolUse":
                     stats.Tools++;
                     if (recent) s.State = "running";
-                    GainXp(1, live);
+                    GainXp(Growth.XpTool, live);
                     break;
                 case "PostToolUseFailure":
                     stats.Tools++;
@@ -1278,7 +1499,7 @@ namespace FireflyPet
                     if (recent) s.State = "running";
                     break;
                 case "SubagentStop":
-                    GainXp(2, live);
+                    GainXp(Growth.XpSubagent, live);
                     break;
                 case "PreCompact":
                     if (recent) s.State = "running";
@@ -1293,10 +1514,10 @@ namespace FireflyPet
                     {
                         Overlay("jumping", 1);
                         string[] done = { "完成啦！来看看吧～", "做好了，要检查一下吗？", "搞定～等你验收哦。" };
-                        Say(done[rnd.Next(done.Length)] + "  +10 XP", 1, 5000);
+                        Say(done[rnd.Next(done.Length)] + "  +" + Growth.XpComplete + " XP", 1, 5000);
                         if (Growth.Level(stats.Xp) >= Growth.FirefliesLevel) Fireflies(7);
                     }
-                    GainXp(10, live);
+                    GainXp(Growth.XpComplete, live);
                     break;
                 }
                 case "StopFailure":
@@ -1418,6 +1639,22 @@ namespace FireflyPet
                 timer.Tick += (s, e) => { timer.Stop(); a(); };
                 timer.Start();
             }
+        }
+
+        void SnapElement(FrameworkElement el, string file)
+        {
+            Directory.CreateDirectory(Program.SnapDir);
+            var rtb = new RenderTargetBitmap((int)Math.Ceiling(el.ActualWidth), (int)Math.Ceiling(el.ActualHeight), 96, 96, PixelFormats.Pbgra32);
+            var host = new DrawingVisual();
+            using (var dc = host.RenderOpen())
+            {
+                dc.DrawRectangle(Brushes.White, null, new Rect(0, 0, el.ActualWidth, el.ActualHeight));
+                dc.DrawRectangle(new VisualBrush(el), null, new Rect(0, 0, el.ActualWidth, el.ActualHeight));
+            }
+            rtb.Render(host);
+            var enc = new PngBitmapEncoder();
+            enc.Frames.Add(BitmapFrame.Create(rtb));
+            using (var f = File.Create(System.IO.Path.Combine(Program.SnapDir, file))) enc.Save(f);
         }
 
         void StartSnapshots()
