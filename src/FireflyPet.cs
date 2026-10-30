@@ -34,6 +34,8 @@ namespace FireflyPet
         public static string AppDir;
         public static string SnapDir;   // 调试用：定时把窗口内容渲染成 PNG
         public static bool HandbookOnStart; // 调试用：启动即打开成长手册（配合 --snap 截图）
+        public static int TestHour = -1;    // 调试用：每日总结按这个钟点判断，不用改系统时间
+        public static string RestartExe;    // 发现新版后，退出时用它重新启动自己
 
         public const string PetMutex = "Local\\FireflyClaudePet";
 
@@ -51,6 +53,7 @@ namespace FireflyPet
                 else if (args[i] == "--watch") watch = true;
                 else if (args[i] == "--hook") hook = true;
                 else if (args[i] == "--handbook") HandbookOnStart = true;
+                else if (args[i] == "--test-hour" && i + 1 < args.Length) int.TryParse(args[++i], out TestHour);
                 else if (args[i] == "--focus-claude") return Desk.FocusClaude();
             }
             Directory.CreateDirectory(DataDir);
@@ -81,6 +84,20 @@ namespace FireflyPet
             Log("已同步安装到 " + dstDir);
         }
 
+        // 启动时记下自己 exe 的修改时间。插件升级后 SyncInstall 会把更新的 exe 放进安装目录（复制保留修改时间），
+        // 正在运行的旧桌宠和守护进程靠比较这个时间发现新版，空闲时自己换成新版。
+        static readonly DateTime SelfTime = ExeTime(System.Reflection.Assembly.GetExecutingAssembly().Location);
+
+        static DateTime ExeTime(string f)
+        {
+            try { return File.GetLastWriteTimeUtc(f); } catch { return DateTime.MaxValue; }
+        }
+
+        public static bool NewerInstalled()
+        {
+            try { return File.Exists(InstalledExe) && ExeTime(InstalledExe) > SelfTime.AddSeconds(2); } catch { return false; }
+        }
+
         public static void LaunchPet()
         {
             if (Watcher.PetRunning()) return;
@@ -106,6 +123,12 @@ namespace FireflyPet
                 app.Run(win);
                 try { File.Delete(pidFile); } catch { }
                 GC.KeepAlive(mutex);
+            }
+            // 互斥量释放之后再启动新版，否则新进程会以为已经有一只在运行
+            if (RestartExe != null)
+            {
+                try { Process.Start(new ProcessStartInfo(RestartExe, "--data \"" + DataDir + "\"") { UseShellExecute = false }); }
+                catch (Exception e) { Log("换新版重启失败: " + e.Message); }
             }
             return 0;
         }
@@ -136,7 +159,7 @@ namespace FireflyPet
                 if (!created) return 0;
                 string cfgFile = System.IO.Path.Combine(Program.DataDir, "config.json");
                 bool was = false;
-                while (true)
+                while (!Program.NewerInstalled())
                 {
                     bool up = ClaudeDesktopRunning();
                     // 只在"桌面端刚启动"时拉起：用户手动退出桌宠后，不会被立刻拉回来
@@ -149,6 +172,11 @@ namespace FireflyPet
                     Thread.Sleep(3000);
                 }
             }
+            // 插件升级带来了新版：自己退出，让新版接着守护
+            Program.Log("守护进程发现新版，切换到 " + Program.InstalledExe);
+            try { Process.Start(new ProcessStartInfo(Program.InstalledExe, "--watch --data \"" + Program.DataDir + "\"") { UseShellExecute = false }); }
+            catch (Exception e) { Program.Log("守护进程换新版失败: " + e.Message); }
+            return 0;
         }
 
         public static bool PetRunning()
@@ -1013,6 +1041,14 @@ namespace FireflyPet
             {
                 if (Watcher.ClaudeDesktopRunning()) { sawClaude = true; claudeGone = 0; }
                 else if (sawClaude && cfg.FollowClaude && ++claudeGone >= 2) Close();
+                // 插件升级后安装目录里有了新版：等她闲下来（没任务、没在说话、没开手册）再换
+                if (Program.NewerInstalled() && BaseState() == "idle" && !dragging && featQueue.Count == 0 &&
+                    !bubbleSticky && DateTime.Now >= bubbleUntil && (handbook == null || !handbook.IsVisible))
+                {
+                    Program.Log("发现新版，换成 " + Program.InstalledExe);
+                    Program.RestartExe = Program.InstalledExe;
+                    Close();
+                }
             };
             follow.Start();
 
@@ -1307,6 +1343,15 @@ namespace FireflyPet
             notify.Click += (s, e) => { cfg.SystemNotify = !cfg.SystemNotify; SaveConfig(); };
             m.Items.Add(notify);
 
+            var testNotify = new MenuItem { Header = "发一条测试通知" };
+            testNotify.Click += (s, e) =>
+            {
+                if (tray == null) { Say("托盘图标还没准备好，过一会儿再试～", 1, 3000, true); return; }
+                ShowToast("测试通知", "能看到这条，说明系统通知正常；点它会切回 Claude。");
+                Say("发了一条系统通知，看看屏幕右下角～没看到的话，检查 Windows 的通知设置和勿扰模式。", 1, 6000, true);
+            };
+            m.Items.Add(testNotify);
+
             var auto = new MenuItem { Header = "随 Claude Code 自动出现", IsCheckable = true, IsChecked = cfg.AutoStart };
             auto.Click += (s, e) => { cfg.AutoStart = !cfg.AutoStart; SaveConfig(); };
             m.Items.Add(auto);
@@ -1450,12 +1495,19 @@ namespace FireflyPet
 
         // 看不到她（隐藏、被全屏挡住、人走开了）时，弹一个系统通知
         DateTime lastNotify = DateTime.MinValue;
+        string lastNotifyTitle = "";
         void Notify(string title, string text)
         {
             if (!cfg.SystemNotify || tray == null) return;
             if (IsVisible && Desk.IdleSeconds() < 60) return;
-            if ((DateTime.Now - lastNotify).TotalSeconds < 5) return; // 授权请求和对应的通知会接连到达，只弹一次
-            lastNotify = DateTime.Now;
+            // 授权请求和对应的通知会接连到达，只弹一次；不同内容（比如紧接着"任务完成"）照常弹
+            if (title == lastNotifyTitle && (DateTime.Now - lastNotify).TotalSeconds < 5) return;
+            lastNotify = DateTime.Now; lastNotifyTitle = title;
+            ShowToast(title, text);
+        }
+
+        void ShowToast(string title, string text)
+        {
             try { tray.ShowBalloonTip(6000, cfg.PetName + " · " + title, text, WF.ToolTipIcon.None); }
             catch (Exception e) { Program.Log("系统通知失败: " + e.Message); }
         }
@@ -1505,7 +1557,7 @@ namespace FireflyPet
         bool MaybeSummary()
         {
             string today = DateTime.Now.ToString("yyyy-MM-dd");
-            if (DateTime.Now.Hour < 18 || stats.SummaryDay == today || stats.TodayCompletes < 1) return false;
+            if ((Program.TestHour >= 0 ? Program.TestHour : DateTime.Now.Hour) < 18 || stats.SummaryDay == today || stats.TodayCompletes < 1) return false;
             stats.SummaryDay = today; statsDirty = true;
             int streak = stats.CurrentStreak();
             Say("今天一起完成了 " + stats.TodayCompletes + " 个任务、调用了 " + stats.TodayTools + " 次工具" +
