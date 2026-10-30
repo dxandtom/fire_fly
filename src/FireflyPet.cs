@@ -618,6 +618,233 @@ namespace FireflyPet
         }
     }
 
+    // ---------------------------------------------------------------- 陪伴报告：今天 / 本周 / 本月 / 今年，随时打开看
+
+    public class ReportWindow : Window
+    {
+        static readonly Brush Ink = new SolidColorBrush(Color.FromRgb(0x2B, 0x33, 0x3A));
+        static readonly Brush Muted = new SolidColorBrush(Color.FromRgb(0x7A, 0x86, 0x8C));
+        static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(0x3F, 0xB8, 0x9C));
+        static readonly Brush Line = new SolidColorBrush(Color.FromRgb(0xE3, 0xEA, 0xE8));
+        static readonly string[] Wk = { "日", "一", "二", "三", "四", "五", "六" };
+
+        readonly Stats stats;
+        readonly StackPanel tabs = new StackPanel { Orientation = Orientation.Horizontal };
+        public readonly StackPanel Body = new StackPanel();
+        string period;
+
+        public ReportWindow(Stats st, string name, string initial)
+        {
+            stats = st; period = initial ?? "day";
+            Title = name + "陪伴报告";
+            Width = 470; Height = 600;
+            WindowStartupLocation = WindowStartupLocation.CenterScreen;
+            Background = new SolidColorBrush(Color.FromRgb(0xF4, 0xF8, 0xF7));
+            FontFamily = new FontFamily("Microsoft YaHei UI");
+            Foreground = Ink;
+            var root = new DockPanel { Margin = new Thickness(22, 16, 22, 20) };
+            DockPanel.SetDock(tabs, Dock.Top);
+            root.Children.Add(tabs);
+            root.Children.Add(new ScrollViewer { Content = Body, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Margin = new Thickness(0, 12, 0, 0) });
+            Content = root;
+            Refresh();
+        }
+
+        public void ShowPeriod(string p) { period = p; Refresh(); }
+
+        // from..to 每天一条；今天用实时数据，没有记录的日子记 0
+        public static List<DayStat> Days(Stats st, DateTime from, DateTime to)
+        {
+            var hist = st.History ?? new List<DayStat>();
+            var map = new Dictionary<string, DayStat>();
+            foreach (var h in hist) if (h.Day != null) map[h.Day] = h;
+            var list = new List<DayStat>();
+            for (var d = from.Date; d <= to.Date; d = d.AddDays(1))
+            {
+                string k = d.ToString("yyyy-MM-dd");
+                DayStat x;
+                if (k == st.Today) list.Add(new DayStat { Day = k, Completes = st.TodayCompletes, Tools = st.TodayTools, Prompts = st.TodayPrompts });
+                else list.Add(map.TryGetValue(k, out x) ? x : new DayStat { Day = k });
+            }
+            return list;
+        }
+
+        static DateTime D(DayStat x) { return DateTime.ParseExact(x.Day, "yyyy-MM-dd", CultureInfo.InvariantCulture); }
+        static bool Active(DayStat x) { return x.Completes > 0 || x.Prompts > 0 || x.Tools > 0; }
+
+        public void Refresh()
+        {
+            tabs.Children.Clear();
+            foreach (var t in new[] { new[] { "day", "今天" }, new[] { "week", "本周" }, new[] { "month", "本月" }, new[] { "year", "今年" } })
+            {
+                string key = t[0];
+                bool on = key == period;
+                var b = new Border
+                {
+                    Background = on ? Accent : Brushes.White, BorderBrush = on ? Accent : Line, BorderThickness = new Thickness(1),
+                    CornerRadius = new CornerRadius(14), Padding = new Thickness(16, 4, 16, 5), Margin = new Thickness(0, 0, 8, 0), Cursor = Cursors.Hand,
+                    Child = new TextBlock { Text = t[1], FontSize = 13, FontWeight = FontWeights.SemiBold, Foreground = on ? Brushes.White : Ink }
+                };
+                b.MouseLeftButtonUp += (s, e) => { if (period != key) { period = key; Refresh(); } };
+                tabs.Children.Add(b);
+            }
+
+            Body.Children.Clear();
+            DateTime today = DateTime.Today, from, prevFrom, prevTo;
+            string title, prevName;
+            if (period == "week")
+            {
+                from = today.AddDays(-(((int)today.DayOfWeek + 6) % 7)); // 周一开始
+                prevFrom = from.AddDays(-7); prevTo = from.AddDays(-1); prevName = "上周";
+                title = "本周 · " + from.ToString("M月d日") + " – " + from.AddDays(6).ToString("M月d日");
+            }
+            else if (period == "month")
+            {
+                from = new DateTime(today.Year, today.Month, 1);
+                prevFrom = from.AddMonths(-1); prevTo = from.AddDays(-1); prevName = "上个月";
+                title = "本月 · " + today.ToString("yyyy年M月");
+            }
+            else if (period == "year")
+            {
+                from = new DateTime(today.Year, 1, 1);
+                prevFrom = from.AddYears(-1); prevTo = from.AddDays(-1); prevName = "去年";
+                title = "今年 · " + today.Year + " 年";
+            }
+            else
+            {
+                from = today; prevFrom = today.AddDays(-1); prevTo = prevFrom; prevName = "昨天";
+                title = "今天 · " + today.ToString("M月d日") + " 周" + Wk[(int)today.DayOfWeek];
+            }
+            var days = Days(stats, from, today);
+            var prev = Days(stats, prevFrom, prevTo);
+            int done = days.Sum(x => x.Completes), prevDone = prev.Sum(x => x.Completes);
+
+            Body.Children.Add(Text(title, 18, FontWeights.Bold, Ink));
+
+            // 四个大数字
+            var g = new UniformGrid { Columns = 4, Margin = new Thickness(0, 10, 0, 0) };
+            g.Children.Add(Big(done, "完成任务"));
+            g.Children.Add(Big(days.Sum(x => x.Prompts), "发出消息"));
+            g.Children.Add(Big(days.Sum(x => x.Tools), "调用工具"));
+            if (period == "day") g.Children.Add(Big(stats.CurrentStreak(), "连续陪伴(天)"));
+            else g.Children.Add(Big(days.Count(Active), "一起工作(天)"));
+            Body.Children.Add(Card(g));
+
+            // 对比与亮点
+            var sp = new StackPanel();
+            int diff = done - prevDone;
+            sp.Children.Add(Text(prevName + "完成了 " + prevDone + " 个任务" +
+                (diff > 0 ? "，" + title.Substring(0, 2) + "多了 " + diff + " 个" : diff < 0 ? (period == "day" ? "" : "，还差 " + (-diff) + " 个追平") : "，" + title.Substring(0, 2) + "一样多"), 12.5, FontWeights.Normal, Ink));
+            if (period != "day")
+            {
+                var best = days.OrderByDescending(x => x.Completes).FirstOrDefault();
+                if (best != null && best.Completes > 0)
+                {
+                    var bd = D(best);
+                    sp.Children.Add(Text("最忙的一天：" + bd.ToString("M月d日") + " 周" + Wk[(int)bd.DayOfWeek] + "，完成了 " + best.Completes + " 个任务", 12.5, FontWeights.Normal, Ink, 4));
+                }
+                int act = days.Count(Active);
+                if (act > 0) sp.Children.Add(Text("一起工作的日子里，平均每天完成 " + (done / (double)act).ToString("0.#") + " 个任务", 12.5, FontWeights.Normal, Ink, 4));
+            }
+            else
+            {
+                sp.Children.Add(Text("今天摸了她 " + stats.TodayPats + " 次 · 最长连续陪伴 " + stats.BestStreak + " 天", 12.5, FontWeights.Normal, Ink, 4));
+                sp.Children.Add(Text(done == 0 ? "今天还没有完成的任务，慢慢来～" : done >= 10 ? "今天超级努力！记得早点休息～" : "今天也辛苦啦～", 12.5, FontWeights.SemiBold, Accent, 6));
+            }
+            Body.Children.Add(Card(sp));
+
+            // 图表：本周按天、本月按天、今年按月
+            if (period == "week")
+            {
+                var all = Days(stats, from, from.AddDays(6));
+                Body.Children.Add(Heading("每天完成的任务"));
+                Body.Children.Add(Card(Bars(all.Select(x => Tuple.Create("周" + Wk[(int)D(x).DayOfWeek], D(x) > today ? -1 : x.Completes)).ToList(), true)));
+            }
+            else if (period == "month")
+            {
+                var all = Days(stats, from, from.AddMonths(1).AddDays(-1));
+                Body.Children.Add(Heading("每天完成的任务"));
+                Body.Children.Add(Card(Bars(all.Select(x => { int d = D(x).Day; return Tuple.Create(d == 1 || d % 5 == 0 ? d.ToString() : "", D(x) > today ? -1 : x.Completes); }).ToList(), false)));
+            }
+            else if (period == "year")
+            {
+                var months = new List<Tuple<string, int>>();
+                for (int m = 1; m <= 12; m++)
+                {
+                    var mf = new DateTime(today.Year, m, 1);
+                    months.Add(Tuple.Create(m + "月", mf > today ? -1 : Days(stats, mf, mf.AddMonths(1).AddDays(-1) > today ? today : mf.AddMonths(1).AddDays(-1)).Sum(x => x.Completes)));
+                }
+                Body.Children.Add(Heading("每月完成的任务"));
+                Body.Children.Add(Card(Bars(months, true)));
+                var tot = new StackPanel();
+                tot.Children.Add(Text("从 " + (stats.FirstMet ?? "") + " 认识到现在：一共完成 " + stats.Completes + " 个任务、发出 " + stats.Prompts + " 条消息、调用 " + stats.Tools + " 次工具、摸头 " + stats.Pats + " 次", 12.5, FontWeights.Normal, Ink));
+                Body.Children.Add(Heading("认识以来"));
+                Body.Children.Add(Card(tot));
+            }
+
+            string first = (stats.History ?? new List<DayStat>()).Select(x => x.Day).Where(x => x != null).OrderBy(x => x).FirstOrDefault() ?? stats.Today;
+            Body.Children.Add(Text("按天的记录从 " + first + " 开始（v1.4.0 起才按天保存，更早的日子在这里记为 0）。", 11, FontWeights.Normal, Muted, 14));
+        }
+
+        // value 为 -1 表示还没到的日子，只画标签
+        UIElement Bars(List<Tuple<string, int>> items, bool showNum)
+        {
+            int max = Math.Max(1, items.Max(x => x.Item2));
+            var g = new Grid { Height = 110 };
+            for (int i = 0; i < items.Count; i++)
+            {
+                g.ColumnDefinitions.Add(new ColumnDefinition());
+                var it = items[i];
+                var col = new DockPanel { Margin = new Thickness(items.Count > 12 ? 0.8 : 4, 0, items.Count > 12 ? 0.8 : 4, 0) };
+                var label = Text(it.Item1, 10.5, FontWeights.Normal, Muted);
+                label.TextWrapping = TextWrapping.NoWrap;
+                label.HorizontalAlignment = HorizontalAlignment.Center;
+                DockPanel.SetDock(label, Dock.Bottom);
+                col.Children.Add(label);
+                var stack = new StackPanel { VerticalAlignment = VerticalAlignment.Bottom };
+                if (it.Item2 >= 0)
+                {
+                    if (showNum)
+                    {
+                        var num = Text(it.Item2.ToString(), 10.5, FontWeights.SemiBold, it.Item2 > 0 ? Ink : Muted);
+                        num.HorizontalAlignment = HorizontalAlignment.Center;
+                        stack.Children.Add(num);
+                    }
+                    stack.Children.Add(new Border
+                    {
+                        Height = Math.Max(2, 66.0 * it.Item2 / max), Background = it.Item2 > 0 ? Accent : Line,
+                        CornerRadius = new CornerRadius(2, 2, 0, 0), ToolTip = it.Item2 + " 个任务"
+                    });
+                }
+                col.Children.Add(stack);
+                Grid.SetColumn(col, i);
+                g.Children.Add(col);
+            }
+            return g;
+        }
+
+        static UIElement Big(int n, string what)
+        {
+            var sp = new StackPanel { HorizontalAlignment = HorizontalAlignment.Center };
+            var a = Text(n.ToString(), 22, FontWeights.Bold, Accent); a.HorizontalAlignment = HorizontalAlignment.Center;
+            var b = Text(what, 11, FontWeights.Normal, Muted); b.HorizontalAlignment = HorizontalAlignment.Center;
+            sp.Children.Add(a); sp.Children.Add(b);
+            return sp;
+        }
+
+        static TextBlock Text(string s, double size, FontWeight w, Brush fg, double top = 0)
+        {
+            return new TextBlock { Text = s, FontSize = size, FontWeight = w, Foreground = fg, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, top, 0, 0) };
+        }
+
+        static TextBlock Heading(string s) { return Text(s, 14, FontWeights.Bold, Ink, 18); }
+
+        static Border Card(UIElement child)
+        {
+            return new Border { Child = child, Background = Brushes.White, BorderBrush = Line, BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(14, 12, 14, 12), Margin = new Thickness(0, 8, 0, 0) };
+        }
+    }
+
     public class DayStat
     {
         public string Day { get; set; }
@@ -822,6 +1049,7 @@ namespace FireflyPet
         readonly Stats stats;
         readonly string petName;
         public readonly StackPanel Body;
+        public Action<string> OpenReport;
 
         public HandbookWindow(Stats st, string name)
         {
@@ -860,12 +1088,16 @@ namespace FireflyPet
             ach.Children.Add(Text("已解锁 " + Feats.All.Count(x => got.Contains(x.Id)) + " / " + Feats.All.Count + " 个成就", 12, FontWeights.SemiBold, Accent, 4));
             foreach (var def in Feats.All)
                 ach.Children.Add(XpRow((got.Contains(def.Id) ? "★ " : "☆ ") + def.Name + " —— " + def.Desc, got.Contains(def.Id) ? "已达成" : "未达成"));
-            ach.Children.Add(Text("晚上 6 点后第一次摸头或把鼠标放到她身上，她会说说今天一起做了什么。", 11.5, FontWeights.Normal, Muted, 6));
+            ach.Children.Add(Text("晚上 6 点后第一次摸头，她会说说今天一起做了什么；右键「陪伴报告」随时能看今天、本周、本月和今年。", 11.5, FontWeights.Normal, Muted, 6));
             Body.Children.Add(CardOf(ach));
 
             // 最近 7 天
             Body.Children.Add(Heading("最近 7 天"));
             Body.Children.Add(CardOf(WeekChart()));
+            var more = Text("查看完整的日报、周报、月报、年报 ›", 12, FontWeights.SemiBold, Accent, 6);
+            more.Cursor = Cursors.Hand;
+            more.MouseLeftButtonUp += (s, e) => { if (OpenReport != null) OpenReport("week"); };
+            Body.Children.Add(more);
 
             // 收藏品
             Body.Children.Add(Heading("收藏品"));
@@ -1055,6 +1287,7 @@ namespace FireflyPet
             Content = new Border { Padding = new Thickness(14, 10, 14, 12), MinWidth = 280, Child = list };
             timer.Tick += (s, e) => Fill();
             timer.Start();
+            Closing += (s, e) => done = true; // 关闭途中会再触发 Deactivated，不能再调 Close
             Closed += (s, e) => { done = true; timer.Stop(); };
             Deactivated += (s, e) => Done(); // 点别处就收起
             Fill();
@@ -1449,6 +1682,16 @@ namespace FireflyPet
         }
 
         HandbookWindow handbook;
+        ReportWindow report;
+
+        void OpenReport(string period)
+        {
+            if (report != null) { report.ShowPeriod(period); report.Activate(); return; }
+            report = new ReportWindow(stats, cfg.PetName, period);
+            report.Closed += (s, e) => report = null;
+            report.Show();
+            report.Activate();
+        }
 
         void ApplyScaling()
         {
@@ -1459,6 +1702,7 @@ namespace FireflyPet
         {
             if (handbook != null) { handbook.Refresh(); handbook.Activate(); return; }
             handbook = new HandbookWindow(stats, cfg.PetName);
+            handbook.OpenReport = OpenReport;
             handbook.Closed += (s, e) => handbook = null;
             handbook.Show();
             handbook.Activate();
@@ -1536,6 +1780,7 @@ namespace FireflyPet
                 menu.Items.Add("显示 / 隐藏", null, (s, e) => ToggleVisible());
                 menu.Items.Add("回到右下角", null, (s, e) => { Show(); ResetPosition(); });
                 menu.Items.Add("成长手册…", null, (s, e) => OpenHandbook());
+                menu.Items.Add("陪伴报告…", null, (s, e) => OpenReport("day"));
                 menu.Items.Add("会话一览…", null, (s, e) => OpenSessions());
                 menu.Items.Add("演示全部动作", null, (s, e) => { Show(); RunDemo(); });
                 menu.Items.Add("-");
@@ -1566,6 +1811,9 @@ namespace FireflyPet
             var book = new MenuItem { Header = "成长手册（等级、解锁、经验怎么来）…", FontWeight = FontWeights.Bold };
             book.Click += (s, e) => OpenHandbook();
             m.Items.Add(book);
+            var rep = new MenuItem { Header = "陪伴报告（今天、本周、本月、今年）…" };
+            rep.Click += (s, e) => OpenReport("day");
+            m.Items.Add(rep);
             var sess = new MenuItem { Header = "会话一览（" + SessionRows().Count + " 个进行中）…" };
             sess.Click += (s, e) => OpenSessions();
             m.Items.Add(sess);
@@ -1775,7 +2023,7 @@ namespace FireflyPet
                 string old = stats.Today;
                 stats.History.RemoveAll(x => x.Day == old);
                 stats.History.Add(new DayStat { Day = old, Completes = stats.TodayCompletes, Tools = stats.TodayTools, Prompts = stats.TodayPrompts });
-                if (stats.History.Count > 60) stats.History.RemoveRange(0, stats.History.Count - 60);
+                if (stats.History.Count > 400) stats.History.RemoveRange(0, stats.History.Count - 400); // 够画「今年」
             }
             stats.Today = today; stats.TodayCompletes = 0; stats.TodayPats = 0; stats.TodayPrompts = 0; stats.TodayTools = 0;
             statsDirty = true;
@@ -2061,7 +2309,7 @@ namespace FireflyPet
             hoverCooldown = DateTime.Now.AddSeconds(6);
             string b = BaseState();
             if ((b == "idle" || b == "review") && !overlay.HasValue) Overlay("jumping", 1);
-            if (!bubbleSticky && DateTime.Now >= bubbleUntil && !MaybeSummary()) Say(StatusLine(), 0, 2500, true);
+            if (!bubbleSticky && DateTime.Now >= bubbleUntil) Say(StatusLine(), 0, 2500, true); // 每日总结只在点她时说，悬停不抢
         }
 
         void OnClick()
