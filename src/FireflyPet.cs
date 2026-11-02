@@ -228,6 +228,20 @@ namespace FireflyPet
 
     static class Desk
     {
+        static int fgPid = -1;
+        static bool fgClaude;
+
+        // 前台窗口是不是 Claude 桌面端：只看窗口属于哪个进程，不读窗口内容
+        public static bool ClaudeInForeground()
+        {
+            IntPtr fg = GetForegroundWindow();
+            if (fg == IntPtr.Zero) return false;
+            int pid;
+            GetWindowThreadProcessId(fg, out pid);
+            if (pid != fgPid) { fgPid = pid; fgClaude = Watcher.DesktopPids().Contains(pid); }
+            return fgClaude;
+        }
+
         public const int FocusOk = 0, FocusNotFound = 1, FocusFlashed = 2;
 
         // 把 Claude 桌面端的主窗口切到最前面
@@ -597,6 +611,8 @@ namespace FireflyPet
         public string LastActiveDay { get; set; }  // 最近一次一起工作的日期
         public int Streak { get; set; }            // 连续一起工作的天数
         public int BestStreak { get; set; }
+        public long ClaudeSeconds { get; set; }       // 和 Claude 一起的时长（桌面端在前台、你在用电脑）
+        public int TodayClaudeSeconds { get; set; }
         public string SummaryDay { get; set; }     // 哪天已经做过每日总结
         public List<string> Achievements { get; set; }
         public List<DayStat> History { get; set; }            // 以前每天的数据，成长手册画最近 7 天
@@ -663,14 +679,14 @@ namespace FireflyPet
             {
                 string k = d.ToString("yyyy-MM-dd");
                 DayStat x;
-                if (k == st.Today) list.Add(new DayStat { Day = k, Completes = st.TodayCompletes, Tools = st.TodayTools, Prompts = st.TodayPrompts });
+                if (k == st.Today) list.Add(new DayStat { Day = k, Completes = st.TodayCompletes, Tools = st.TodayTools, Prompts = st.TodayPrompts, ClaudeSeconds = st.TodayClaudeSeconds });
                 else list.Add(map.TryGetValue(k, out x) ? x : new DayStat { Day = k });
             }
             return list;
         }
 
         static DateTime D(DayStat x) { return DateTime.ParseExact(x.Day, "yyyy-MM-dd", CultureInfo.InvariantCulture); }
-        static bool Active(DayStat x) { return x.Completes > 0 || x.Prompts > 0 || x.Tools > 0; }
+        static bool Active(DayStat x) { return x.Completes > 0 || x.Prompts > 0 || x.Tools > 0 || x.ClaudeSeconds >= 60; }
 
         public void Refresh()
         {
@@ -743,11 +759,14 @@ namespace FireflyPet
                     var bd = D(best);
                     sp.Children.Add(Text("最忙的一天：" + bd.ToString("M月d日") + " 周" + Wk[(int)bd.DayOfWeek] + "，完成了 " + best.Completes + " 个任务", 12.5, FontWeights.Normal, Ink, 4));
                 }
+                long secs = days.Sum(x => (long)x.ClaudeSeconds);
+                sp.Children.Add(Text("和 Claude 一起待了 " + Growth.Duration(secs) + "（" + prevName + " " + Growth.Duration(prev.Sum(x => (long)x.ClaudeSeconds)) + "）", 12.5, FontWeights.Normal, Ink, 4));
                 int act = days.Count(Active);
                 if (act > 0) sp.Children.Add(Text("一起工作的日子里，平均每天完成 " + (done / (double)act).ToString("0.#") + " 个任务", 12.5, FontWeights.Normal, Ink, 4));
             }
             else
             {
+                sp.Children.Add(Text("和 Claude 一起待了 " + Growth.Duration(stats.TodayClaudeSeconds) + "（昨天 " + Growth.Duration(prev.Sum(x => x.ClaudeSeconds)) + "）", 12.5, FontWeights.Normal, Ink, 4));
                 sp.Children.Add(Text("今天摸了她 " + stats.TodayPats + " 次 · 最长连续陪伴 " + stats.BestStreak + " 天", 12.5, FontWeights.Normal, Ink, 4));
                 sp.Children.Add(Text(done == 0 ? "今天还没有完成的任务，慢慢来～" : done >= 10 ? "今天超级努力！记得早点休息～" : "今天也辛苦啦～", 12.5, FontWeights.SemiBold, Accent, 6));
             }
@@ -777,13 +796,14 @@ namespace FireflyPet
                 Body.Children.Add(Heading("每月完成的任务"));
                 Body.Children.Add(Card(Bars(months, true)));
                 var tot = new StackPanel();
-                tot.Children.Add(Text("从 " + (stats.FirstMet ?? "") + " 认识到现在：一共完成 " + stats.Completes + " 个任务、发出 " + stats.Prompts + " 条消息、调用 " + stats.Tools + " 次工具、摸头 " + stats.Pats + " 次", 12.5, FontWeights.Normal, Ink));
+                tot.Children.Add(Text("从 " + (stats.FirstMet ?? "") + " 认识到现在：一共完成 " + stats.Completes + " 个任务、发出 " + stats.Prompts + " 条消息、调用 " + stats.Tools + " 次工具、摸头 " + stats.Pats + " 次，和 Claude 一起待了 " + Growth.Duration(stats.ClaudeSeconds), 12.5, FontWeights.Normal, Ink));
                 Body.Children.Add(Heading("认识以来"));
                 Body.Children.Add(Card(tot));
             }
 
             string first = (stats.History ?? new List<DayStat>()).Select(x => x.Day).Where(x => x != null).OrderBy(x => x).FirstOrDefault() ?? stats.Today;
-            Body.Children.Add(Text("按天的记录从 " + first + " 开始（v1.4.0 起才按天保存，更早的日子在这里记为 0）。", 11, FontWeights.Normal, Muted, 14));
+            Body.Children.Add(Text("按天的记录从 " + first + " 开始（v1.4.0 起才按天保存，更早的日子在这里记为 0）。" +
+                "「一起待了」是 Claude 桌面端在前台、你在用电脑的时间，聊天和 Code 都算，不读任何聊天内容；从 v1.4.2 开始统计。", 11, FontWeights.Normal, Muted, 14));
         }
 
         // value 为 -1 表示还没到的日子，只画标签
@@ -848,6 +868,7 @@ namespace FireflyPet
     public class DayStat
     {
         public string Day { get; set; }
+        public int ClaudeSeconds { get; set; }
         public int Completes { get; set; }
         public int Tools { get; set; }
         public int Prompts { get; set; }
@@ -947,6 +968,14 @@ namespace FireflyPet
 
         // 各行为给的经验（事件处理和成长手册共用）
         public const int XpComplete = 10, XpPrompt = 3, XpSubagent = 2, XpTool = 1, XpPat = 1, PatsPerDay = 20;
+        public const int XpClaudeTime = 2, ClaudeXpMinutes = 10, ClaudeXpPerDay = 12; // 一起待 10 分钟 +2，每天最多算 2 小时
+
+        public static string Duration(long sec)
+        {
+            long m = sec / 60;
+            if (m < 1) return "不到 1 分钟";
+            return m < 60 ? m + " 分钟" : (m / 60) + " 小时" + (m % 60 > 0 ? " " + (m % 60) + " 分" : "");
+        }
 
         static readonly int[] TitleAt = { 1, 3, 6, 10, 15, 20, 30 };
         static readonly string[] Titles = { "初遇的萤火", "小小同行者", "默契搭档", "可靠的伙伴", "萤火守望者", "燃烧的萤火", "永不熄灭的萤火" };
@@ -1123,6 +1152,7 @@ namespace FireflyPet
             xp.Children.Add(XpRow("子代理（subagent）完成一次", "+" + Growth.XpSubagent));
             xp.Children.Add(XpRow("工具调用成功一次", "+" + Growth.XpTool));
             xp.Children.Add(XpRow("摸头（点她一下）", "+" + Growth.XpPat + "，每天最多 " + Growth.PatsPerDay + " 次"));
+            xp.Children.Add(XpRow("和 Claude 一起待 " + Growth.ClaudeXpMinutes + " 分钟（桌面端在前台）", "+" + Growth.XpClaudeTime + "，每天最多 " + Growth.ClaudeXpMinutes * Growth.ClaudeXpPerDay / 60 + " 小时"));
             xp.Children.Add(Text("出错、等你授权、开会话不加经验。桌宠没开时发生的事件会在下次启动时补算。", 11.5, FontWeights.Normal, Muted, 6));
             Body.Children.Add(CardOf(xp));
 
@@ -1151,7 +1181,7 @@ namespace FireflyPet
             {
                 string d = DateTime.Now.AddDays(-i).ToString("yyyy-MM-dd");
                 days.Add(d == stats.Today
-                    ? new DayStat { Day = d, Completes = stats.TodayCompletes, Tools = stats.TodayTools, Prompts = stats.TodayPrompts }
+                    ? new DayStat { Day = d, Completes = stats.TodayCompletes, Tools = stats.TodayTools, Prompts = stats.TodayPrompts, ClaudeSeconds = stats.TodayClaudeSeconds }
                     : hist.FirstOrDefault(h => h.Day == d) ?? new DayStat { Day = d });
             }
             int max = Math.Max(1, days.Max(x => x.Completes));
@@ -2012,20 +2042,40 @@ namespace FireflyPet
 
         const int StuckMinutes = 10;
 
+        // 和 Claude 一起的时长：桌面端（聊天和 Code 标签页都算）在前台、你 2 分钟内动过电脑才计时；锁屏时前台不是它
+        DateTime lastTimeTick = DateTime.Now;
+        void TrackClaudeTime(DateTime t)
+        {
+            double gap = (t - lastTimeTick).TotalSeconds;
+            if (gap < 5) return;
+            lastTimeTick = t;
+            if (gap > 15) return; // 电脑睡眠/卡住过，这段不算
+            bool on;
+            try { on = Desk.IdleSeconds() < 120 && Desk.ClaudeInForeground(); } catch { on = false; }
+            if (!on) return;
+            int add = (int)Math.Round(gap);
+            int before = stats.TodayClaudeSeconds;
+            stats.TodayClaudeSeconds += add; stats.ClaudeSeconds += add;
+            int chunk = Growth.ClaudeXpMinutes * 60;
+            if (before / chunk != stats.TodayClaudeSeconds / chunk && stats.TodayClaudeSeconds / chunk <= Growth.ClaudeXpPerDay)
+                GainXp(Growth.XpClaudeTime, true);
+            if (before / 60 != stats.TodayClaudeSeconds / 60) statsDirty = true; // 每满一分钟存一次，不必每 5 秒写盘
+        }
+
         void RollDay()
         {
             string today = DateTime.Now.ToString("yyyy-MM-dd");
             if (stats.Today == today) return;
             // 把过去那天记进历史，成长手册画最近 7 天
-            if (!string.IsNullOrEmpty(stats.Today) && (stats.TodayCompletes > 0 || stats.TodayTools > 0 || stats.TodayPrompts > 0))
+            if (!string.IsNullOrEmpty(stats.Today) && (stats.TodayCompletes > 0 || stats.TodayTools > 0 || stats.TodayPrompts > 0 || stats.TodayClaudeSeconds > 0))
             {
                 if (stats.History == null) stats.History = new List<DayStat>();
                 string old = stats.Today;
                 stats.History.RemoveAll(x => x.Day == old);
-                stats.History.Add(new DayStat { Day = old, Completes = stats.TodayCompletes, Tools = stats.TodayTools, Prompts = stats.TodayPrompts });
+                stats.History.Add(new DayStat { Day = old, Completes = stats.TodayCompletes, Tools = stats.TodayTools, Prompts = stats.TodayPrompts, ClaudeSeconds = stats.TodayClaudeSeconds });
                 if (stats.History.Count > 400) stats.History.RemoveRange(0, stats.History.Count - 400); // 够画「今年」
             }
-            stats.Today = today; stats.TodayCompletes = 0; stats.TodayPats = 0; stats.TodayPrompts = 0; stats.TodayTools = 0;
+            stats.Today = today; stats.TodayCompletes = 0; stats.TodayPats = 0; stats.TodayPrompts = 0; stats.TodayTools = 0; stats.TodayClaudeSeconds = 0;
             statsDirty = true;
         }
 
@@ -2107,10 +2157,13 @@ namespace FireflyPet
         bool MaybeSummary()
         {
             string today = DateTime.Now.ToString("yyyy-MM-dd");
-            if ((Program.TestHour >= 0 ? Program.TestHour : DateTime.Now.Hour) < 18 || stats.SummaryDay == today || stats.TodayCompletes < 1) return false;
+            if ((Program.TestHour >= 0 ? Program.TestHour : DateTime.Now.Hour) < 18 || stats.SummaryDay == today || (stats.TodayCompletes < 1 && stats.TodayClaudeSeconds < 600)) return false;
             stats.SummaryDay = today; statsDirty = true;
             int streak = stats.CurrentStreak();
-            Say("今天一起完成了 " + stats.TodayCompletes + " 个任务、调用了 " + stats.TodayTools + " 次工具" +
+            string with = stats.TodayClaudeSeconds >= 60 ? "和 Claude 一起待了 " + Growth.Duration(stats.TodayClaudeSeconds) : "";
+            Say((stats.TodayCompletes > 0
+                    ? "今天一起完成了 " + stats.TodayCompletes + " 个任务、调用了 " + stats.TodayTools + " 次工具" + (with != "" ? "，" + with : "")
+                    : "今天" + with) +
                 (streak >= 2 ? "，已经连续陪你 " + streak + " 天啦" : "") + "，辛苦啦～", 1, 7000, true);
             return true;
         }
@@ -2190,6 +2243,7 @@ namespace FireflyPet
                     s.State = "idle";
             }
             RollDay();
+            TrackClaudeTime(t);
             AnnounceFeats();
             CheckCare(t);
             UpdateChip();
