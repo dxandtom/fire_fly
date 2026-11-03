@@ -38,6 +38,9 @@ namespace FireflyPet
         public static string RestartExe;    // 发现新版后，退出时用它重新启动自己
 
         public const string PetMutex = "Local\\FireflyClaudePet";
+        // 退出信号：桌宠是工具窗口，收不到系统的"关闭"消息；--quit 发这两个信号，她们存好数据后自己退出
+        public const string PetQuit = "Local\\FireflyClaudePetQuit", WatchQuit = "Local\\FireflyClaudePetWatchQuit";
+        public const string WatchMutex = "Local\\FireflyClaudePetWatch";
 
         [STAThread]
         static int Main(string[] args)
@@ -55,11 +58,28 @@ namespace FireflyPet
                 else if (args[i] == "--handbook") HandbookOnStart = true;
                 else if (args[i] == "--test-hour" && i + 1 < args.Length) int.TryParse(args[++i], out TestHour);
                 else if (args[i] == "--focus-claude") return Desk.FocusClaude();
+                else if (args[i] == "--quit") return Quit();
             }
             Directory.CreateDirectory(DataDir);
             if (hook) return Hook.Run();
             if (watch) return Watcher.Run();
             return RunPet(demo);
+        }
+
+        // 让正在运行的桌宠和守护进程退出，最多等 10 秒；返回 0 = 都已退出
+        static int Quit()
+        {
+            foreach (string name in new[] { PetQuit, WatchQuit })
+            {
+                EventWaitHandle ev;
+                if (EventWaitHandle.TryOpenExisting(name, out ev)) using (ev) ev.Set();
+            }
+            for (int i = 0; i < 100; i++)
+            {
+                if (!Watcher.PetRunning() && !Watcher.WatchRunning()) return 0;
+                Thread.Sleep(100);
+            }
+            return 1;
         }
 
         // 桌宠和守护进程固定从这里运行（插件目录会随版本变化，开机自启需要一个稳定路径）
@@ -120,7 +140,15 @@ namespace FireflyPet
                 app.ShutdownMode = ShutdownMode.OnMainWindowClose;
                 app.DispatcherUnhandledException += (s, e) => { Log("未处理异常: " + e.Exception); e.Handled = true; };
                 var win = new PetWindow(demo);
+                var quit = new EventWaitHandle(false, EventResetMode.AutoReset, PetQuit);
+                new Thread(() =>
+                {
+                    quit.WaitOne();
+                    Log("收到退出信号");
+                    win.Dispatcher.BeginInvoke(new Action(() => win.Close()));
+                }) { IsBackground = true }.Start();
                 app.Run(win);
+                GC.KeepAlive(quit);
                 try { File.Delete(pidFile); } catch { }
                 GC.KeepAlive(mutex);
             }
@@ -154,11 +182,12 @@ namespace FireflyPet
         public static int Run()
         {
             bool created;
-            using (var mutex = new Mutex(true, "Local\\FireflyClaudePetWatch", out created))
+            using (var mutex = new Mutex(true, Program.WatchMutex, out created))
             {
                 if (!created) return 0;
                 string cfgFile = System.IO.Path.Combine(Program.DataDir, "config.json");
                 bool was = false;
+                var quit = new EventWaitHandle(false, EventResetMode.AutoReset, Program.WatchQuit);
                 while (!Program.NewerInstalled())
                 {
                     bool up = ClaudeDesktopRunning();
@@ -169,7 +198,7 @@ namespace FireflyPet
                         catch (Exception e) { Program.Log("守护进程启动桌宠失败: " + e.Message); }
                     }
                     was = up;
-                    Thread.Sleep(3000);
+                    if (quit.WaitOne(3000)) { Program.Log("守护进程收到退出信号"); return 0; }
                 }
             }
             // 插件升级带来了新版：自己退出，让新版接着守护
@@ -179,39 +208,95 @@ namespace FireflyPet
             return 0;
         }
 
-        public static bool PetRunning()
+        public static bool PetRunning() { return MutexExists(Program.PetMutex); }
+        public static bool WatchRunning() { return MutexExists(Program.WatchMutex); }
+
+        static bool MutexExists(string name)
         {
             Mutex m;
-            if (!Mutex.TryOpenExisting(Program.PetMutex, out m)) return false;
+            if (!Mutex.TryOpenExisting(name, out m)) return false;
             m.Dispose();
             return true;
         }
 
         // Claude 桌面端的主程序也叫 claude.exe；Claude Code CLI（含桌面端内置的那份）同名，按路径排除
-        public static bool ClaudeDesktopRunning() { return DesktopPids().Count > 0; }
+        // 每 3 秒问一次：先看上次找到的那个桌面端进程还在不在（很便宜），不在了才把所有进程扫一遍
+        static int knownDesktop;
+        public static bool ClaudeDesktopRunning()
+        {
+            if (knownDesktop != 0 && IsDesktopPath(ImagePath(knownDesktop, true))) return true;
+            knownDesktop = DesktopPids().FirstOrDefault();
+            return knownDesktop != 0;
+        }
+
+        public static bool IsDesktopPath(string path)
+        {
+            path = path.ToLowerInvariant();
+            return path.EndsWith("\\claude.exe") && !path.Contains("\\claude-code\\") && !path.Contains("\\.local\\") && !path.Contains("\\npm\\");
+        }
+
+        // 每个 claude.exe 是不是桌面端只查一次路径；进程列表用轻量快照（Process.GetProcessesByName 每次约 10ms）
+        static readonly Dictionary<int, bool> desktopCache = new Dictionary<int, bool>();
 
         public static HashSet<int> DesktopPids()
         {
             var pids = new HashSet<int>();
-            foreach (var p in Process.GetProcessesByName("claude"))
+            lock (desktopCache)
             {
-                try
+                var alive = PidsNamed("claude.exe");
+                foreach (int pid in desktopCache.Keys.Where(k => !alive.Contains(k)).ToList()) desktopCache.Remove(pid);
+                foreach (int pid in alive)
                 {
-                    string path = ImagePath(p.Id).ToLowerInvariant();
-                    if (path.Length > 0 && !path.Contains("\\claude-code\\") && !path.Contains("\\.local\\") && !path.Contains("\\npm\\"))
-                        pids.Add(p.Id);
+                    bool desk;
+                    if (!desktopCache.TryGetValue(pid, out desk))
+                    {
+                        string path = ImagePath(pid);
+                        desk = IsDesktopPath(path);
+                        if (path.Length > 0) desktopCache[pid] = desk; // 查不到路径的（刚启动或没权限）下次再查
+                    }
+                    if (desk) pids.Add(pid);
                 }
-                finally { p.Dispose(); }
             }
             return pids;
         }
 
-        static string ImagePath(int pid)
+        static HashSet<int> PidsNamed(string exe)
+        {
+            var pids = new HashSet<int>();
+            IntPtr snap = CreateToolhelp32Snapshot(2 /* TH32CS_SNAPPROCESS */, 0);
+            if (snap == IntPtr.Zero || snap == new IntPtr(-1)) return pids;
+            try
+            {
+                var e = new PROCESSENTRY32 { dwSize = Marshal.SizeOf(typeof(PROCESSENTRY32)) };
+                for (bool ok = Process32First(snap, ref e); ok; ok = Process32Next(snap, ref e))
+                    if (string.Equals(e.szExeFile, exe, StringComparison.OrdinalIgnoreCase)) pids.Add(e.th32ProcessID);
+            }
+            finally { CloseHandle(snap); }
+            return pids;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct PROCESSENTRY32
+        {
+            public int dwSize, cntUsage, th32ProcessID;
+            public IntPtr th32DefaultHeapID;
+            public int th32ModuleID, cntThreads, th32ParentProcessID, pcPriClassBase, dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr CreateToolhelp32Snapshot(int flags, int pid);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32FirstW")] static extern bool Process32First(IntPtr snap, ref PROCESSENTRY32 e);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32NextW")] static extern bool Process32Next(IntPtr snap, ref PROCESSENTRY32 e);
+
+        // aliveOnly：进程已经退出（还有别人拿着句柄）时当作不存在
+        public static string ImagePath(int pid, bool aliveOnly = false)
         {
             IntPtr h = OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, pid);
             if (h == IntPtr.Zero) return "";
             try
             {
+                int code;
+                if (aliveOnly && GetExitCodeProcess(h, out code) && code != 259 /* STILL_ACTIVE */) return "";
                 var sb = new StringBuilder(1024);
                 int size = sb.Capacity;
                 return QueryFullProcessImageName(h, 0, sb, ref size) ? sb.ToString() : "";
@@ -222,6 +307,7 @@ namespace FireflyPet
         [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern bool QueryFullProcessImageName(IntPtr h, int flags, StringBuilder sb, ref int size);
         [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll")] static extern bool GetExitCodeProcess(IntPtr h, out int code);
     }
 
     // ---------------------------------------------------------------- 窗口工具：跳回 Claude、全屏检测
@@ -229,18 +315,29 @@ namespace FireflyPet
     static class Desk
     {
         static int fgPid = -1;
-        static bool fgClaude;
+        static int fgKind;
+        static readonly HashSet<string> Terminals = new HashSet<string> {
+            "windowsterminal", "openconsole", "conhost", "cmd", "powershell", "pwsh", "wezterm-gui", "alacritty", "mintty",
+            "code", "cursor", "windsurf", "idea64", "pycharm64", "webstorm64", "rider64", "goland64", "clion64" };
 
-        // 前台窗口是不是 Claude 桌面端：只看窗口属于哪个进程，不读窗口内容
-        public static bool ClaudeInForeground()
+        // 前台窗口属于谁：1 = Claude 桌面端，2 = 终端或编辑器（可能在用 Claude Code CLI），0 = 其他。只看进程，不读窗口内容
+        public static int ForegroundKind()
         {
             IntPtr fg = GetForegroundWindow();
-            if (fg == IntPtr.Zero) return false;
+            if (fg == IntPtr.Zero) return 0;
             int pid;
             GetWindowThreadProcessId(fg, out pid);
-            if (pid != fgPid) { fgPid = pid; fgClaude = Watcher.DesktopPids().Contains(pid); }
-            return fgClaude;
+            if (pid != fgPid)
+            {
+                fgPid = pid;
+                string path = Watcher.ImagePath(pid);
+                fgKind = Watcher.IsDesktopPath(path) ? 1
+                    : Terminals.Contains(System.IO.Path.GetFileNameWithoutExtension(path).ToLowerInvariant()) ? 2 : 0;
+            }
+            return fgKind;
         }
+
+        public static bool ClaudeInForeground() { return ForegroundKind() == 1; }
 
         public const int FocusOk = 0, FocusNotFound = 1, FocusFlashed = 2;
 
@@ -545,21 +642,49 @@ namespace FireflyPet
             try { return (long)Convert.ToDouble(v, CultureInfo.InvariantCulture); } catch { return 0; }
         }
 
+        // 读不出来时依次试 .bak（上一份好的）和 .tmp（写完但没来得及换上的），都不行才从空白开始；坏文件留一份 .broken 备查
         public static T Load<T>(string file) where T : new()
         {
-            try { if (File.Exists(file)) return S.Deserialize<T>(File.ReadAllText(file, Encoding.UTF8)); }
-            catch (Exception e) { Program.Log("读取失败 " + file + ": " + e.Message); }
+            bool broken = false;
+            foreach (string f in new[] { file, file + ".bak", file + ".tmp" })
+            {
+                if (!File.Exists(f)) continue;
+                try
+                {
+                    T v = S.Deserialize<T>(File.ReadAllText(f, Encoding.UTF8));
+                    if (v == null) throw new InvalidDataException("空内容");
+                    if (f != file) Program.Log("从 " + System.IO.Path.GetFileName(f) + " 恢复了 " + System.IO.Path.GetFileName(file));
+                    return v;
+                }
+                catch (Exception e)
+                {
+                    Program.Log("读取失败 " + f + ": " + e.Message);
+                    if (f == file && !broken) { broken = true; try { File.Copy(file, file + ".broken", true); } catch { } }
+                }
+            }
             return new T();
         }
 
+        // 先完整写进 .tmp 并刷到磁盘，再原子替换；旧的那份留作 .bak。任何时刻被打断，至少有一份完整的
         public static void Save(string file, object o)
         {
             try
             {
                 string tmp = file + ".tmp";
-                File.WriteAllText(tmp, S.Serialize(o), new UTF8Encoding(false));
-                if (File.Exists(file)) File.Delete(file);
-                File.Move(tmp, file);
+                byte[] data = new UTF8Encoding(false).GetBytes(S.Serialize(o));
+                using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
+                {
+                    fs.Write(data, 0, data.Length);
+                    fs.Flush(true);
+                }
+                if (!File.Exists(file)) { File.Move(tmp, file); return; }
+                try { File.Replace(tmp, file, file + ".bak", true); }
+                catch (IOException)
+                {
+                    File.Copy(file, file + ".bak", true);
+                    File.Copy(tmp, file, true);
+                    File.Delete(tmp);
+                }
             }
             catch (Exception e) { Program.Log("保存失败 " + file + ": " + e.Message); }
         }
@@ -611,7 +736,7 @@ namespace FireflyPet
         public string LastActiveDay { get; set; }  // 最近一次一起工作的日期
         public int Streak { get; set; }            // 连续一起工作的天数
         public int BestStreak { get; set; }
-        public long ClaudeSeconds { get; set; }       // 和 Claude 一起的时长（桌面端在前台、你在用电脑）
+        public long ClaudeSeconds { get; set; }       // 和 Claude 一起的时长（桌面端在前台，或终端里的 Claude Code 正在活动；你在用电脑）
         public int TodayClaudeSeconds { get; set; }
         public string SummaryDay { get; set; }     // 哪天已经做过每日总结
         public List<string> Achievements { get; set; }
@@ -803,7 +928,7 @@ namespace FireflyPet
 
             string first = (stats.History ?? new List<DayStat>()).Select(x => x.Day).Where(x => x != null).OrderBy(x => x).FirstOrDefault() ?? stats.Today;
             Body.Children.Add(Text("按天的记录从 " + first + " 开始（v1.4.0 起才按天保存，更早的日子在这里记为 0）。" +
-                "「一起待了」是 Claude 桌面端在前台、你在用电脑的时间，聊天和 Code 都算，不读任何聊天内容；从 v1.4.2 开始统计。", 11, FontWeights.Normal, Muted, 14));
+                "「一起待了」是你在用电脑、并且 Claude 桌面端在前台（聊天和 Code 都算），或终端/编辑器在前台且 Claude Code 3 分钟内有动静的时间；不读任何聊天内容。v1.4.2 起统计桌面端，v1.4.3 起计入终端。", 11, FontWeights.Normal, Muted, 14));
         }
 
         // value 为 -1 表示还没到的日子，只画标签
@@ -1152,7 +1277,7 @@ namespace FireflyPet
             xp.Children.Add(XpRow("子代理（subagent）完成一次", "+" + Growth.XpSubagent));
             xp.Children.Add(XpRow("工具调用成功一次", "+" + Growth.XpTool));
             xp.Children.Add(XpRow("摸头（点她一下）", "+" + Growth.XpPat + "，每天最多 " + Growth.PatsPerDay + " 次"));
-            xp.Children.Add(XpRow("和 Claude 一起待 " + Growth.ClaudeXpMinutes + " 分钟（桌面端在前台）", "+" + Growth.XpClaudeTime + "，每天最多 " + Growth.ClaudeXpMinutes * Growth.ClaudeXpPerDay / 60 + " 小时"));
+            xp.Children.Add(XpRow("和 Claude 一起待 " + Growth.ClaudeXpMinutes + " 分钟（桌面端或终端里的 Claude Code）", "+" + Growth.XpClaudeTime + "，每天最多 " + Growth.ClaudeXpMinutes * Growth.ClaudeXpPerDay / 60 + " 小时"));
             xp.Children.Add(Text("出错、等你授权、开会话不加经验。桌宠没开时发生的事件会在下次启动时补算。", 11.5, FontWeights.Normal, Muted, 6));
             Body.Children.Add(CardOf(xp));
 
@@ -1464,7 +1589,6 @@ namespace FireflyPet
         readonly Stopwatch clock = Stopwatch.StartNew();
         double lastTickMs;
         bool statsDirty;
-        DateTime lastStaleCheck = DateTime.MinValue;
         bool demoMode;
 
         // 甩出去 / 坐窗口 / 子代理萤火 / 夜光 / 会话一览
@@ -1540,9 +1664,22 @@ namespace FireflyPet
             };
             Closed += (s, e) => { SaveStats(); if (tray != null) { tray.Visible = false; tray.Dispose(); } };
 
+            // 画面每 33ms 一帧；藏起来时停掉，人离开 5 分钟以上（多半锁屏了）降到每秒 4 帧
             var tick = new DispatcherTimer(DispatcherPriority.Render) { Interval = TimeSpan.FromMilliseconds(33) };
             tick.Tick += (s, e) => Tick();
             tick.Start();
+            IsVisibleChanged += (s, e) => tick.IsEnabled = IsVisible;
+            // 换日、计时、会话超时这些不看画面，每秒一次，藏起来也照常
+            var stale = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+            stale.Tick += (s, e) =>
+            {
+                CheckStale(DateTime.Now);
+                double idle = 0;
+                try { idle = Desk.IdleSeconds(); } catch { }
+                var want = TimeSpan.FromMilliseconds(idle > 300 && BaseState() == "idle" && !walking && !throwing ? 250 : 33);
+                if (tick.Interval != want) tick.Interval = want;
+            };
+            stale.Start();
             var poll = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(250) };
             poll.Tick += (s, e) => PollEvents();
             poll.Start();
@@ -1553,12 +1690,21 @@ namespace FireflyPet
             {
                 if (Watcher.ClaudeDesktopRunning()) { sawClaude = true; claudeGone = 0; }
                 else if (sawClaude && cfg.FollowClaude && ++claudeGone >= 2) Close();
-                // 插件升级后安装目录里有了新版：等她闲下来（没任务、没在说话、没开手册）再换
-                if (Program.NewerInstalled() && BaseState() == "idle" && !dragging && !throwing && featQueue.Count == 0 && announce.Count == 0 &&
-                    !bubbleSticky && DateTime.Now >= bubbleUntil && (handbook == null || !handbook.IsVisible))
+                // 插件升级后安装目录里有了新版、或者内存占用太高：等她闲下来（没任务、没在说话、没开窗口）再换个新进程
+                if (!QuietNow()) return;
+                if (Program.NewerInstalled())
                 {
                     Program.Log("发现新版，换成 " + Program.InstalledExe);
                     Program.RestartExe = Program.InstalledExe;
+                    Close();
+                    return;
+                }
+                long mb = 0;
+                try { using (var me = Process.GetCurrentProcess()) mb = me.PrivateMemorySize64 >> 20; } catch { }
+                if (mb >= MemoryLimitMb)
+                {
+                    Program.Log("内存占用 " + mb + "MB，重启一下");
+                    Program.RestartExe = System.Reflection.Assembly.GetExecutingAssembly().Location;
                     Close();
                 }
             };
@@ -1571,6 +1717,14 @@ namespace FireflyPet
 
         bool sawClaude;
         int claudeGone;
+        const long MemoryLimitMb = 400; // 刚启动约 100MB 出头；长时间运行涨到这里就趁空闲换个新进程
+
+        bool QuietNow()
+        {
+            return BaseState() == "idle" && !dragging && !throwing && featQueue.Count == 0 && announce.Count == 0 &&
+                !bubbleSticky && DateTime.Now >= bubbleUntil &&
+                (handbook == null || !handbook.IsVisible) && report == null && (sessionsWin == null || !sessionsWin.IsVisible);
+        }
         bool autoHidden; // 因为全屏被自动藏起来（用户手动隐藏的不算）
 
         void CheckFullscreen()
@@ -1596,12 +1750,19 @@ namespace FireflyPet
             bmp.Freeze();
             int rows = bmp.PixelHeight / CellH, cols = bmp.PixelWidth / CellW;
             frames = new BitmapSource[rows, cols];
+            // 每帧复制成独立位图。用 CroppedBitmap 的话，透明窗口每换一帧 WPF 都会重新生成一份底层渲染资源且不释放，
+            // 实测显示时每分钟涨约 5MB（隐藏或不换帧时不涨）
+            var src = new FormatConvertedBitmap(bmp, PixelFormats.Pbgra32, null, 0);
+            src.Freeze();
+            int stride = CellW * 4;
+            var px = new byte[stride * CellH];
             for (int r = 0; r < rows; r++)
                 for (int c = 0; c < cols; c++)
                 {
-                    var cb = new CroppedBitmap(bmp, new Int32Rect(c * CellW, r * CellH, CellW, CellH));
-                    cb.Freeze();
-                    frames[r, c] = cb;
+                    src.CopyPixels(new Int32Rect(c * CellW, r * CellH, CellW, CellH), px, stride, 0);
+                    var f = BitmapSource.Create(CellW, CellH, bmp.DpiX, bmp.DpiY, PixelFormats.Pbgra32, null, px, stride);
+                    f.Freeze();
+                    frames[r, c] = f;
                 }
         }
 
@@ -1955,8 +2116,6 @@ namespace FireflyPet
             lastTickMs = now;
             DateTime t = DateTime.Now;
 
-            if ((t - lastStaleCheck).TotalSeconds >= 1) { lastStaleCheck = t; CheckStale(t); }
-
             string baseState = BaseState();
             UpdateLook(t, baseState);
             UpdateWander(t, dt, baseState);
@@ -2051,7 +2210,13 @@ namespace FireflyPet
             lastTimeTick = t;
             if (gap > 15) return; // 电脑睡眠/卡住过，这段不算
             bool on;
-            try { on = Desk.IdleSeconds() < 120 && Desk.ClaudeInForeground(); } catch { on = false; }
+            try
+            {
+                int kind = Desk.IdleSeconds() < 120 ? Desk.ForegroundKind() : 0;
+                // 终端或编辑器在前台时，要有 Claude Code 会话 3 分钟内有动静才算（不然只是在写别的代码）
+                on = kind == 1 || (kind == 2 && sessions.Values.Any(x => (t - x.Last).TotalMinutes < 3));
+            }
+            catch { on = false; }
             if (!on) return;
             int add = (int)Math.Round(gap);
             int before = stats.TodayClaudeSeconds;
