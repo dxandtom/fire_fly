@@ -136,6 +136,9 @@ namespace FireflyPet
                 string pidFile = System.IO.Path.Combine(DataDir, "pet.pid");
                 try { File.WriteAllText(pidFile, Process.GetCurrentProcess().Id.ToString()); } catch { }
 
+                // 透明窗口用显卡渲染时，每帧要从显存读回再贴到桌面，这条路径在画萤火、气泡渐变、夜光时会漏非托管内存
+                // （实测每分钟 5～27MB）。窗口很小，软件渲染反而更省：不再泄漏，启动内存从约 160MB 降到约 80MB，CPU 也更低
+                RenderOptions.ProcessRenderMode = System.Windows.Interop.RenderMode.SoftwareOnly;
                 var app = new Application();
                 app.ShutdownMode = ShutdownMode.OnMainWindowClose;
                 app.DispatcherUnhandledException += (s, e) => { Log("未处理异常: " + e.Exception); e.Handled = true; };
@@ -1551,6 +1554,7 @@ namespace FireflyPet
         Border bubble;
         StackPanel bubbleWrap;
         TextBlock bubbleText;
+        Polygon bubbleTail;
         Border badge;
         TextBlock badgeText;
         Rectangle badgeBar;
@@ -1717,7 +1721,7 @@ namespace FireflyPet
 
         bool sawClaude;
         int claudeGone;
-        const long MemoryLimitMb = 400; // 刚启动约 100MB 出头；长时间运行涨到这里就趁空闲换个新进程
+        const long MemoryLimitMb = 300; // 刚启动约 80MB；万一长时间运行涨到这里，就趁空闲换个新进程（保底，正常到不了）
 
         bool QuietNow()
         {
@@ -1750,8 +1754,8 @@ namespace FireflyPet
             bmp.Freeze();
             int rows = bmp.PixelHeight / CellH, cols = bmp.PixelWidth / CellW;
             frames = new BitmapSource[rows, cols];
-            // 每帧复制成独立位图。用 CroppedBitmap 的话，透明窗口每换一帧 WPF 都会重新生成一份底层渲染资源且不释放，
-            // 实测显示时每分钟涨约 5MB（隐藏或不换帧时不涨）
+            // 每帧复制成独立位图：CroppedBitmap 每次绘制都要重新裁剪（显卡渲染下还会漏内存，实测每分钟约 5MB），
+            // 独立位图多占约 10MB，软件渲染下 CPU 少三成
             var src = new FormatConvertedBitmap(bmp, PixelFormats.Pbgra32, null, 0);
             src.Freeze();
             int stride = CellW * 4;
@@ -1794,7 +1798,7 @@ namespace FireflyPet
                 Padding = new Thickness(9, 4, 9, 5),
                 MaxWidth = 220,
             };
-            var tail = new Polygon
+            bubbleTail = new Polygon
             {
                 Points = new PointCollection { new Point(0, 0), new Point(12, 0), new Point(6, 7) },
                 Fill = bubble.Background,
@@ -1803,9 +1807,9 @@ namespace FireflyPet
                 HorizontalAlignment = HorizontalAlignment.Center,
                 Margin = new Thickness(0, -1.5, 0, 0),
             };
-            bubbleWrap = new StackPanel { VerticalAlignment = VerticalAlignment.Bottom, HorizontalAlignment = HorizontalAlignment.Center, Opacity = 0 };
+            bubbleWrap = new StackPanel { VerticalAlignment = VerticalAlignment.Bottom, HorizontalAlignment = HorizontalAlignment.Center, Visibility = Visibility.Hidden };
             bubbleWrap.Children.Add(bubble);
-            bubbleWrap.Children.Add(tail);
+            bubbleWrap.Children.Add(bubbleTail);
             bubbleWrap.IsHitTestVisible = false;
             Grid.SetRow(bubbleWrap, 0);
             Panel.SetZIndex(bubbleWrap, 10);
@@ -1816,7 +1820,7 @@ namespace FireflyPet
             sprite = new Image { Stretch = Stretch.Fill, Cursor = Cursors.Hand };
             ApplyScaling();
             fx = new Canvas { IsHitTestVisible = false };
-            nightGlow = new Ellipse { IsHitTestVisible = false, Opacity = 0, Fill = MakeNightGlow() };
+            nightGlow = new Ellipse { IsHitTestVisible = false, Visibility = Visibility.Collapsed, Fill = NightSteps[0] };
             spriteHost.Children.Add(nightGlow);
             spriteHost.Children.Add(sprite);
             spriteHost.Children.Add(fx);
@@ -2122,6 +2126,7 @@ namespace FireflyPet
             UpdateThrow(dt);
             UpdatePerch(t);
             UpdateOrbit();
+            UpdateSparks();
             UpdateGlow(t);
 
             string want;
@@ -2141,8 +2146,39 @@ namespace FireflyPet
             if (bubbleSticky && baseState != "waiting") { bubbleSticky = false; bubbleUntil = t; }
             bool showBubble = bubbleSticky || t < bubbleUntil;
             double target = showBubble ? 1 : 0;
-            if (Math.Abs(bubbleWrap.Opacity - target) > 0.01)
-                bubbleWrap.Opacity += Math.Sign(target - bubbleWrap.Opacity) * Math.Min(Math.Abs(target - bubbleWrap.Opacity), dt / 160);
+            if (bubbleAlpha != target)
+                SetBubbleAlpha(bubbleAlpha + Math.Sign(target - bubbleAlpha) * Math.Min(Math.Abs(target - bubbleAlpha), dt / 160));
+        }
+
+        // 渐变不用 Opacity（元素或画刷的都不用），换成"颜色里带 alpha"的冻结画刷，分 16 档：
+        // 软件渲染下 Opacity 要先画到离屏缓冲再混合，更费 CPU，实测剩余的内存增长也更大
+        const int AlphaSteps = 16;
+        static Color Fade(Color c, double a) { return Color.FromArgb((byte)Math.Round(c.A * a), c.R, c.G, c.B); }
+        static Brush[] Steps(Func<double, Brush> make)
+        {
+            var r = new Brush[AlphaSteps + 1];
+            for (int i = 0; i <= AlphaSteps; i++) { r[i] = make((double)i / AlphaSteps); r[i].Freeze(); }
+            return r;
+        }
+        static Brush Step(Brush[] steps, double a) { return steps[(int)Math.Round(Math.Max(0, Math.Min(1, a)) * AlphaSteps)]; }
+        static Brush[] SolidSteps(Color c) { return Steps(a => new SolidColorBrush(Fade(c, a))); }
+
+        static readonly Brush[] BubbleBg = SolidSteps(Color.FromArgb(0xF2, 0xFF, 0xFF, 0xFF));
+        static readonly Brush[] BubbleLine = SolidSteps(Color.FromRgb(0x6C, 0xCF, 0xB8));
+        static readonly Brush[] BubbleInk = SolidSteps(Color.FromRgb(0x2B, 0x33, 0x3A));
+
+        double bubbleAlpha;
+        void SetBubbleAlpha(double a)
+        {
+            bubbleAlpha = a;
+            Brush bg = Step(BubbleBg, a);
+            if (bubble.Background != bg)
+            {
+                bubble.Background = bubbleTail.Fill = bg;
+                bubble.BorderBrush = bubbleTail.Stroke = Step(BubbleLine, a);
+                bubbleText.Foreground = Step(BubbleInk, a);
+            }
+            bubbleWrap.Visibility = a > 0 ? Visibility.Visible : Visibility.Hidden;
         }
 
         void Advance(double dt)
@@ -2892,15 +2928,33 @@ namespace FireflyPet
 
         // ------------------------------------------------------------ 特效
 
-        static readonly Brush Glow = MakeGlow();
-        static Brush MakeGlow()
+        static readonly Brush[] GlowSteps = Steps(MakeGlow);
+        static Brush MakeGlow(double a)
         {
             var b = new RadialGradientBrush();
-            b.GradientStops.Add(new GradientStop(Color.FromArgb(0xFF, 0xFF, 0xFF, 0xD8), 0));
-            b.GradientStops.Add(new GradientStop(Color.FromArgb(0xE0, 0xD8, 0xFF, 0x7A), 0.35));
+            b.GradientStops.Add(new GradientStop(Fade(Color.FromArgb(0xFF, 0xFF, 0xFF, 0xD8), a), 0));
+            b.GradientStops.Add(new GradientStop(Fade(Color.FromArgb(0xE0, 0xD8, 0xFF, 0x7A), a), 0.35));
             b.GradientStops.Add(new GradientStop(Color.FromArgb(0x00, 0x9A, 0xF5, 0x6A), 1));
-            b.Freeze();
             return b;
+        }
+
+        // 飞出去的萤火：位置用动画，亮度每帧按进度换档位画刷（不用 Opacity 动画，见 AlphaSteps）
+        class Spark { public Ellipse E; public double Start, Dur; }
+        readonly List<Spark> sparks = new List<Spark>();
+
+        void UpdateSparks()
+        {
+            double now = clock.Elapsed.TotalMilliseconds;
+            for (int i = sparks.Count - 1; i >= 0; i--)
+            {
+                var sp = sparks[i];
+                double p = (now - sp.Start) / sp.Dur;
+                if (p >= 1) { fx.Children.Remove(sp.E); sparks.RemoveAt(i); continue; }
+                double a = p <= 0 ? 0 : p < 0.25 ? p / 0.25 : p < 0.55 ? 1 - 0.3 * (p - 0.25) / 0.3 : 0.7 * (1 - (p - 0.55) / 0.45);
+                Brush b = Step(GlowSteps, a);
+                if (sp.E.Fill != b) sp.E.Fill = b;
+                sp.E.Visibility = a > 0 ? Visibility.Visible : Visibility.Hidden;
+            }
         }
 
         void Fireflies(int n)
@@ -2908,7 +2962,7 @@ namespace FireflyPet
             for (int i = 0; i < n; i++)
             {
                 double size = 9 * Math.Max(scale, 0.6);
-                var e = new Ellipse { Width = size, Height = size, Fill = Glow, Opacity = 0 };
+                var e = new Ellipse { Width = size, Height = size, Fill = GlowSteps[0], Visibility = Visibility.Hidden };
                 double x0 = spriteW * (0.15 + 0.7 * rnd.NextDouble()), y0 = spriteH * (0.45 + 0.45 * rnd.NextDouble());
                 Canvas.SetLeft(e, x0); Canvas.SetTop(e, y0);
                 fx.Children.Add(e);
@@ -2916,16 +2970,9 @@ namespace FireflyPet
                 var begin = TimeSpan.FromMilliseconds(i * 110);
                 var ay = new DoubleAnimation(y0, y0 - spriteH * (0.45 + 0.35 * rnd.NextDouble()), dur) { BeginTime = begin, EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut } };
                 var ax = new DoubleAnimation(x0, x0 + (rnd.NextDouble() - 0.5) * 50 * scale, dur) { BeginTime = begin };
-                var ao = new DoubleAnimationUsingKeyFrames { BeginTime = begin, Duration = dur };
-                ao.KeyFrames.Add(new LinearDoubleKeyFrame(0, KeyTime.FromPercent(0)));
-                ao.KeyFrames.Add(new LinearDoubleKeyFrame(1, KeyTime.FromPercent(0.25)));
-                ao.KeyFrames.Add(new LinearDoubleKeyFrame(0.7, KeyTime.FromPercent(0.55)));
-                ao.KeyFrames.Add(new LinearDoubleKeyFrame(0, KeyTime.FromPercent(1)));
-                var el = e;
-                ao.Completed += (s, a) => fx.Children.Remove(el);
+                sparks.Add(new Spark { E = e, Start = clock.Elapsed.TotalMilliseconds + begin.TotalMilliseconds, Dur = dur.TotalMilliseconds });
                 e.BeginAnimation(Canvas.TopProperty, ay);
                 e.BeginAnimation(Canvas.LeftProperty, ax);
-                e.BeginAnimation(OpacityProperty, ao);
             }
         }
 
@@ -3039,7 +3086,7 @@ namespace FireflyPet
             while (orbiters.Count < n)
             {
                 double size = 7 * Math.Max(scale, 0.6);
-                var e = new Ellipse { Width = size, Height = size, Fill = Glow, IsHitTestVisible = false };
+                var e = new Ellipse { Width = size, Height = size, Fill = GlowSteps[AlphaSteps], IsHitTestVisible = false };
                 orbiters.Add(e);
                 fx.Children.Add(e);
             }
@@ -3051,25 +3098,32 @@ namespace FireflyPet
                 var e = orbiters[i];
                 Canvas.SetLeft(e, spriteW / 2 + Math.Cos(a) * spriteW * 0.42 - e.Width / 2);
                 Canvas.SetTop(e, spriteH * 0.58 + Math.Sin(a) * spriteH * 0.08 - e.Height / 2);
-                e.Opacity = (Math.Sin(a) < 0 ? 0.35 : 0.9) * (0.75 + 0.25 * Math.Sin(sec * 4 + i)); // 转到身后时暗一些
+                Brush b = Step(GlowSteps, (Math.Sin(a) < 0 ? 0.35 : 0.9) * (0.75 + 0.25 * Math.Sin(sec * 4 + i))); // 转到身后时暗一些
+                if (e.Fill != b) e.Fill = b;
             }
         }
 
         // Lv.20 夜光：晚上 7 点到早上 6 点，身后亮起柔和的萤光
         void UpdateGlow(DateTime t)
         {
-            bool on = (t.Hour >= 19 || t.Hour < 6) && Growth.Level(stats.Xp) >= Growth.GlowLevel;
+            int h = Program.TestHour >= 0 ? Program.TestHour : t.Hour;
+            bool on = (h >= 19 || h < 6) && Growth.Level(stats.Xp) >= Growth.GlowLevel;
             double target = on ? 0.7 + 0.3 * Math.Sin(clock.Elapsed.TotalSeconds * 1.3) : 0;
-            if (Math.Abs(nightGlow.Opacity - target) > 0.003) nightGlow.Opacity += (target - nightGlow.Opacity) * 0.06;
+            if (Math.Abs(nightAlpha - target) <= 0.003) return;
+            nightAlpha = target == 0 && nightAlpha < 0.02 ? 0 : nightAlpha + (target - nightAlpha) * 0.06;
+            Brush b = Step(NightSteps, nightAlpha);
+            if (nightGlow.Fill != b) nightGlow.Fill = b;
+            nightGlow.Visibility = nightAlpha > 0 ? Visibility.Visible : Visibility.Collapsed;
         }
 
-        static Brush MakeNightGlow()
+        double nightAlpha;
+        static readonly Brush[] NightSteps = Steps(MakeNightGlow);
+        static Brush MakeNightGlow(double a)
         {
             var b = new RadialGradientBrush();
-            b.GradientStops.Add(new GradientStop(Color.FromArgb(0x55, 0x9E, 0xFF, 0xD8), 0));
-            b.GradientStops.Add(new GradientStop(Color.FromArgb(0x22, 0x7F, 0xE6, 0xC8), 0.55));
+            b.GradientStops.Add(new GradientStop(Fade(Color.FromArgb(0x55, 0x9E, 0xFF, 0xD8), a), 0));
+            b.GradientStops.Add(new GradientStop(Fade(Color.FromArgb(0x22, 0x7F, 0xE6, 0xC8), a), 0.55));
             b.GradientStops.Add(new GradientStop(Color.FromArgb(0x00, 0x7F, 0xE6, 0xC8), 1));
-            b.Freeze();
             return b;
         }
 

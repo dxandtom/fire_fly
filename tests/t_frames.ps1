@@ -1,4 +1,5 @@
-﻿# 动画帧：每帧是独立位图（不是 CroppedBitmap，后者会让透明窗口泄漏内存），像素与从精灵表直接裁剪的结果逐字节一致
+﻿# 动画帧：每帧是独立位图（不是 CroppedBitmap，后者会让透明窗口泄漏内存），像素与从精灵表直接裁剪的结果逐字节一致；
+# 界面上没有半透明元素（渐变都改调画刷）
 # 用法：powershell -NoProfile -STA -File tests\t_frames.ps1（只用临时数据目录，只做数值比对）
 param([string]$Exe = "$PSScriptRoot\..\plugins\firefly-pet\bin\FireflyPet.exe", [string]$Dir = "$env:TEMP\ff-t-frames")
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -32,5 +33,22 @@ for ($r = 0; $r -lt $fr.GetLength(0); $r++) { for ($c = 0; $c -lt $fr.GetLength(
   if (-not [System.Linq.Enumerable]::SequenceEqual([byte[]]$a, [byte[]]$b) -or $f.DpiX -ne $bmp.DpiX -or $f.PixelWidth -ne $cw) { $bad++ }
 } }
 "帧数 $n，仍是 CroppedBitmap 的 $crop，像素/DPI 不一致的 $bad"
+
+# 透明窗口里元素的 Opacity 介于 0 和 1 之间会让每次重绘漏内存：气泡淡入到一半、飞出萤火时检查整棵界面树
+$say = $pw.GetMethod('Say', $I, $null, [Type[]]@([string], [int], [int], [bool]), $null)
+$tick = $pw.GetMethod('Tick', $I)
+$tick.Invoke($w, $null) # 先走一帧，下一帧的间隔才是这里的 20ms
+$say.Invoke($w, @('测试气泡', 1, 2500, $true))
+for ($k = 0; $k -lt 3; $k++) { Start-Sleep -Milliseconds 20; $tick.Invoke($w, $null) }
+$pw.GetMethod('Fireflies', $I).Invoke($w, @(5))
+$af = $pw.GetField('bubbleAlpha', $I)
+$alpha = if ($af) { $af.GetValue($w) } else { $pw.GetField('bubbleWrap', $I).GetValue($w).Opacity } # 旧版没有 bubbleAlpha
+$half = 0; $q = New-Object System.Collections.Queue; $q.Enqueue($w)
+while ($q.Count) { $e = $q.Dequeue()
+  if ($e -is [System.Windows.UIElement] -and $e.Opacity -gt 0 -and $e.Opacity -lt 1) { $half++ }
+  foreach ($c in [System.Windows.LogicalTreeHelper]::GetChildren($e)) { if ($c -is [System.Windows.DependencyObject]) { $q.Enqueue($c) } } }
+"气泡淡入进度 {0:N2}，半透明元素 {1} 个" -f $alpha, $half
+if ($alpha -le 0 -or $alpha -ge 1) { "  （没测到淡入中途）" }
+if ($half) { $bad++ }
 $w.Close(); Remove-Item -Recurse -Force $Dir -EA SilentlyContinue
 if ($crop -or $bad -or $n -eq 0) { "失败"; exit 1 } else { "全部通过" }
