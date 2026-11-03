@@ -2,7 +2,7 @@
 // 编译：%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe -out:%TEMP%\mem_host.exe -r:WPF\PresentationFramework.dll
 //       -r:WPF\PresentationCore.dll -r:WPF\WindowsBase.dll -r:System.Xaml.dll tests\mem_host.cs（-r 路径都在同一个 Framework64 目录下）
 // 用法：mem_host.exe <FireflyPet.exe> <临时数据目录> <秒数> <模式>
-//   模式：base 正常显示 | hidden 隐藏 | frozen 所有帧换成同一张（排查帧切换） | talk 每 3 秒换一句气泡 | text 只换文字、气泡常亮 | fade 文字不变、反复淡入淡出 | bubble50 / glow50 气泡或夜光固定半透明 | orbit 三颗子代理萤火 | sparks 每 3 秒飞出 5 颗萤火 | glowon 夜光一直亮着（晚上 9 点、满级） | control 不加载桌宠，只有空窗口和 33ms 空定时器（对照）
+//   模式：base 正常显示 | hidden 隐藏 | frozen 所有帧换成同一张（排查帧切换） | talk 每 3 秒换一句气泡 | text 只换文字、气泡常亮 | festive 节日飘雪+打节拍+彩色萤火 | fade 文字不变、反复淡入淡出 | bubble50 / glow50 气泡或夜光固定半透明 | orbit 三颗子代理萤火 | sparks 每 3 秒飞出 5 颗萤火 | glowon 夜光一直亮着（晚上 9 点、满级） | control 不加载桌宠，只有空窗口和 33ms 空定时器（对照）
 //   模式后加 -sw（如 sparks-sw）用软件渲染。
 //   多组可以同时开多个进程并行测。数据目录会先清空，务必用临时目录。
 using System;
@@ -84,6 +84,17 @@ static class Host
             var sp = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
             sp.Tick += (s, e) => fire.Invoke(w, new object[] { 5 });
             sp.Start();
+        }
+        if (mode == "festive")
+        {
+            // 圣诞：桌宠自己的节日逻辑一直飘雪；再每秒打一次节拍、每 5 秒撒一次彩色萤火
+            w.GetType().Assembly.GetType("FireflyPet.Program").GetField("TestDate", S).SetValue(null, (DateTime?)new DateTime(2026, 12, 25));
+            var beat = w.GetType().GetMethod("Beat", I);
+            var conf = w.GetType().GetMethod("Confetti", I);
+            int beats = 0;
+            var bt = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+            bt.Tick += (s, e) => { beat.Invoke(w, null); if (++beats % 5 == 0) conf.Invoke(w, new object[] { 14 }); };
+            bt.Start();
         }
         if (mode == "talk" || mode == "text" || mode == "fade")
         {

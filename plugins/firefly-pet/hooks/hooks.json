@@ -7,7 +7,8 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/FireflyPet.exe\" --hook",
-            "timeout": 5
+            "timeout": 5,
+            "async": true
           }
         ]
       }
@@ -29,7 +30,8 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/FireflyPet.exe\" --hook",
-            "timeout": 5
+            "timeout": 5,
+            "async": true
           }
         ]
       }
@@ -79,7 +81,8 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/FireflyPet.exe\" --hook",
-            "timeout": 5
+            "timeout": 5,
+            "async": true
           }
         ],
         "matcher": "*"
@@ -103,7 +106,8 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/FireflyPet.exe\" --hook",
-            "timeout": 5
+            "timeout": 5,
+            "async": true
           }
         ]
       }
@@ -114,7 +118,8 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/FireflyPet.exe\" --hook",
-            "timeout": 5
+            "timeout": 5,
+            "async": true
           }
         ]
       }

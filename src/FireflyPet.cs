@@ -36,6 +36,10 @@ namespace FireflyPet
         public static bool HandbookOnStart; // 调试用：启动即打开成长手册（配合 --snap 截图）
         public static int TestHour = -1;    // 调试用：每日总结按这个钟点判断，不用改系统时间
         public static string RestartExe;    // 发现新版后，退出时用它重新启动自己
+        public static DateTime? TestDate;   // 调试用：节日按这个日期判断（--test-date 2026-12-25）
+        public static DateTime Today { get { return TestDate ?? DateTime.Today; } }
+        // 进程一启动就取时间：几个异步 hook 同时启动时，按它排序更接近事件发生的顺序
+        public static readonly long StartMs = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
 
         public const string PetMutex = "Local\\FireflyClaudePet";
         // 退出信号：桌宠是工具窗口，收不到系统的"关闭"消息；--quit 发这两个信号，她们存好数据后自己退出
@@ -57,6 +61,11 @@ namespace FireflyPet
                 else if (args[i] == "--hook") hook = true;
                 else if (args[i] == "--handbook") HandbookOnStart = true;
                 else if (args[i] == "--test-hour" && i + 1 < args.Length) int.TryParse(args[++i], out TestHour);
+                else if (args[i] == "--test-date" && i + 1 < args.Length)
+                {
+                    DateTime td;
+                    if (DateTime.TryParse(args[++i], CultureInfo.InvariantCulture, DateTimeStyles.None, out td)) TestDate = td.Date;
+                }
                 else if (args[i] == "--focus-claude") return Desk.FocusClaude();
                 else if (args[i] == "--quit") return Quit();
             }
@@ -92,7 +101,13 @@ namespace FireflyPet
             string self = System.Reflection.Assembly.GetExecutingAssembly().Location;
             string dst = InstalledExe, dstDir = System.IO.Path.GetDirectoryName(dst);
             if (string.Equals(System.IO.Path.GetFullPath(self), System.IO.Path.GetFullPath(dst), StringComparison.OrdinalIgnoreCase)) return;
-            if (File.Exists(dst) && File.ReadAllBytes(dst).SequenceEqual(File.ReadAllBytes(self))) return;
+            if (File.Exists(dst))
+            {
+                var a = new FileInfo(dst);
+                var b = new FileInfo(self);
+                if (a.Length == b.Length && a.LastWriteTimeUtc == b.LastWriteTimeUtc) return;
+                if (a.Length == b.Length && File.ReadAllBytes(dst).SequenceEqual(File.ReadAllBytes(self))) return;
+            }
             // 插件升级后没重启的旧会话，hook 还在用旧插件目录里的 exe：安装目录里已经是更新的版本，就不要倒退回去
             if (File.Exists(dst) && ExeTime(dst) > ExeTime(self).AddSeconds(2))
             {
@@ -474,6 +489,184 @@ namespace FireflyPet
     // 插件的 hooks.json 以 `FireflyPet.exe --hook` 调用：Claude Code 把事件 JSON 写到 stdin，
     // 这里精简后追加到 events.jsonl，桌宠自己去读。必须快、必须安静：不向 stdout 输出任何内容
     // （UserPromptSubmit 的 stdout 会进上下文），永远返回 0。
+    // hook 每次都是新起的进程：加载 JavaScriptSerializer（System.Web.Extensions）就要 40ms 左右，
+    // 所以 hook 用这个只有几十行的小解析器；桌宠自己仍用 Json 类
+    static class MiniJson
+    {
+        public static Dictionary<string, object> Parse(string s)
+        {
+            try { int i = 0; return Value(s, ref i) as Dictionary<string, object>; } catch { return null; }
+        }
+
+        static void Ws(string s, ref int i) { while (i < s.Length && char.IsWhiteSpace(s[i])) i++; }
+
+        static object Value(string s, ref int i)
+        {
+            Ws(s, ref i);
+            char c = s[i];
+            if (c == '{')
+            {
+                var d = new Dictionary<string, object>();
+                i++; Ws(s, ref i);
+                if (s[i] == '}') { i++; return d; }
+                while (true)
+                {
+                    Ws(s, ref i);
+                    string k = Str(s, ref i);
+                    Ws(s, ref i);
+                    if (s[i++] != ':') throw new FormatException();
+                    d[k] = Value(s, ref i);
+                    Ws(s, ref i);
+                    char n = s[i++];
+                    if (n == '}') return d;
+                    if (n != ',') throw new FormatException();
+                }
+            }
+            if (c == '[')
+            {
+                var l = new List<object>();
+                i++; Ws(s, ref i);
+                if (s[i] == ']') { i++; return l; }
+                while (true)
+                {
+                    l.Add(Value(s, ref i));
+                    Ws(s, ref i);
+                    char n = s[i++];
+                    if (n == ']') return l;
+                    if (n != ',') throw new FormatException();
+                }
+            }
+            if (c == '"') return Str(s, ref i);
+            if (string.CompareOrdinal(s, i, "true", 0, 4) == 0) { i += 4; return true; }
+            if (string.CompareOrdinal(s, i, "false", 0, 5) == 0) { i += 5; return false; }
+            if (string.CompareOrdinal(s, i, "null", 0, 4) == 0) { i += 4; return null; }
+            int st = i;
+            while (i < s.Length && "+-0123456789.eE".IndexOf(s[i]) >= 0) i++;
+            string num = s.Substring(st, i - st);
+            long lv;
+            if (long.TryParse(num, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out lv)) return lv;
+            return double.Parse(num, CultureInfo.InvariantCulture);
+        }
+
+        static string Str(string s, ref int i)
+        {
+            if (s[i] != '"') throw new FormatException();
+            i++;
+            var sb = new StringBuilder();
+            while (true)
+            {
+                char c = s[i++];
+                if (c == '"') return sb.ToString();
+                if (c != '\\') { sb.Append(c); continue; }
+                char e = s[i++];
+                switch (e)
+                {
+                    case 'n': sb.Append('\n'); break;
+                    case 't': sb.Append('\t'); break;
+                    case 'r': sb.Append('\r'); break;
+                    case 'b': sb.Append('\b'); break;
+                    case 'f': sb.Append('\f'); break;
+                    case 'u': sb.Append((char)Convert.ToInt32(s.Substring(i, 4), 16)); i += 4; break;
+                    default: sb.Append(e); break;
+                }
+            }
+        }
+
+        public static string Write(object v)
+        {
+            var sb = new StringBuilder();
+            W(sb, v);
+            return sb.ToString();
+        }
+
+        static void W(StringBuilder sb, object v)
+        {
+            if (v == null) { sb.Append("null"); return; }
+            if (v is bool) { sb.Append((bool)v ? "true" : "false"); return; }
+            if (v is string) { Q(sb, (string)v); return; }
+            var d = v as IDictionary<string, object>;
+            if (d != null)
+            {
+                sb.Append('{');
+                bool first = true;
+                foreach (var kv in d) { if (!first) sb.Append(','); first = false; Q(sb, kv.Key); sb.Append(':'); W(sb, kv.Value); }
+                sb.Append('}');
+                return;
+            }
+            var l = v as System.Collections.IEnumerable;
+            if (l != null)
+            {
+                sb.Append('[');
+                bool first = true;
+                foreach (var x in l) { if (!first) sb.Append(','); first = false; W(sb, x); }
+                sb.Append(']');
+                return;
+            }
+            if (v is double || v is float) { sb.Append(Convert.ToDouble(v).ToString("R", CultureInfo.InvariantCulture)); return; }
+            sb.Append(Convert.ToString(v, CultureInfo.InvariantCulture));
+        }
+
+        static void Q(StringBuilder sb, string s)
+        {
+            sb.Append('"');
+            foreach (char c in s)
+            {
+                if (c == '"' || c == '\\') sb.Append('\\').Append(c);
+                else if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
+                else sb.Append(c);
+            }
+            sb.Append('"');
+        }
+    }
+
+    // ---------------------------------------------------------------- 节日
+
+    static class Festival
+    {
+        // 今天是不是节日：kind 决定特效，greet 是她当天第一次见到你时说的话；生日格式 MM-dd
+        public static bool Find(DateTime d, string birthday, out string kind, out string greet)
+        {
+            kind = null; greet = null;
+            string md = d.ToString("MM-dd", CultureInfo.InvariantCulture);
+            if (!string.IsNullOrEmpty(birthday) && md == birthday) { kind = "birthday"; greet = "生日快乐！今天是你的生日，烟花是给你放的～"; return true; }
+            int lm, ld, tm, td;
+            bool leap, tleap;
+            Lunar(d, out lm, out ld, out leap);
+            Lunar(d.AddDays(1), out tm, out td, out tleap);
+            if (tm == 1 && td == 1 && !tleap) { kind = "fireworks"; greet = "今天是除夕，一起守岁吧～新年快乐！"; return true; }
+            if (!leap)
+            {
+                if (lm == 1 && ld <= 3) { kind = "fireworks"; greet = "新春快乐！新的一年也请多指教～"; return true; }
+                if (lm == 1 && ld == 15) { kind = "lanterns"; greet = "元宵节快乐！今天吃汤圆了吗？"; return true; }
+                if (lm == 5 && ld == 5) { kind = "leaves"; greet = "端午安康～记得吃粽子。"; return true; }
+                if (lm == 7 && ld == 7) { kind = "hearts"; greet = "今天是七夕，萤火也想陪你看星星。"; return true; }
+                if (lm == 8 && ld == 15) { kind = "moon"; greet = "中秋快乐！今晚的月亮一定很圆。"; return true; }
+            }
+            switch (md)
+            {
+                case "01-01": kind = "fireworks"; greet = "元旦快乐！新的一年，一起写出更好的代码吧～"; break;
+                case "02-14": kind = "hearts"; greet = "情人节快乐～今天也有我陪着你。"; break;
+                case "10-31": kind = "spooky"; greet = "万圣节快乐！不给糖就捣蛋～"; break;
+                case "12-24": kind = "snow"; greet = "平安夜快乐，外面下雪了吗？"; break;
+                case "12-25": kind = "snow"; greet = "圣诞快乐！今天也辛苦啦～"; break;
+                case "12-31": kind = "fireworks"; greet = "今天是跨年夜，这一年辛苦啦！"; break;
+            }
+            return kind != null;
+        }
+
+        // 农历月日；闰月 leap = true（闰月不过节）
+        static void Lunar(DateTime d, out int month, out int day, out bool leap)
+        {
+            var cal = new ChineseLunisolarCalendar();
+            month = 0; day = 0; leap = false;
+            if (d < cal.MinSupportedDateTime || d > cal.MaxSupportedDateTime) return;
+            int y = cal.GetYear(d), m = cal.GetMonth(d), lp = cal.GetLeapMonth(y);
+            day = cal.GetDayOfMonth(d);
+            if (lp > 0 && m >= lp) { leap = m == lp; m--; }
+            month = m;
+        }
+    }
+
     static class Hook
     {
         public static int Run()
@@ -515,7 +708,7 @@ namespace FireflyPet
         static string ToolDetail(string tool, Dictionary<string, object> input)
         {
             if (input == null) return "";
-            Func<string, string> s = k => Json.Str(input, k);
+            Func<string, string> s = k => Str(input, k);
             switch (tool)
             {
                 case "Bash": case "PowerShell": return Short(s("description") != "" ? s("description") : s("command"), 40);
@@ -527,6 +720,25 @@ namespace FireflyPet
                 case "Task": case "Agent": return Short(s("description") != "" ? s("description") : s("subagent_type"), 30);
                 default: return Short(s("description") != "" ? s("description") : s("file_path"), 30);
             }
+        }
+
+        static string Str(Dictionary<string, object> d, string k)
+        {
+            object v;
+            if (d == null || !d.TryGetValue(k, out v) || v == null) return "";
+            return Convert.ToString(v, CultureInfo.InvariantCulture);
+        }
+
+        const string TestPattern = @"\b(pytest|jest|vitest|mocha|phpunit|rspec|ctest|tox)\b|\b(go|cargo|dotnet|mvn|gradlew?|swift|deno|bun|mix|flutter)\s+test\b|\b(npm|pnpm|yarn)\s+(run\s+)?test|\bpython\S*\s+-m\s+(pytest|unittest)\b|\bmake\s+(test|check)\b|\bt_\w+\.ps1\b|\btests?[\\/][\w.\\/-]+\.(ps1|sh|py|js|ts)\b";
+        const string BuildPattern = @"\b(npm|pnpm|yarn)\s+(run\s+)?build\b|\b(cargo|go|dotnet|swift|zig)\s+build\b|\bmsbuild\b|\bmvn\s+(package|compile|install|verify)\b|\bgradlew?\s+(build|assemble)\b|\bcmake\s+--build\b|(^|[;&|(]\s*)make(\s|$)|\btsc\b|\bnode\s+build\.js\b|\bvite\s+build\b|\bnext\s+build\b|\bwebpack\b|\bcsc(\.exe)?\b";
+
+        public static string CommandKind(string cmd)
+        {
+            if (string.IsNullOrEmpty(cmd)) return "";
+            var o = System.Text.RegularExpressions.RegexOptions.IgnoreCase;
+            if (System.Text.RegularExpressions.Regex.IsMatch(cmd, TestPattern, o)) return "test";
+            if (System.Text.RegularExpressions.Regex.IsMatch(cmd, BuildPattern, o)) return "build";
+            return "";
         }
 
         // 桌宠没在运行时没人取走事件，文件会一直变大；超过上限就只留最近的一段
@@ -549,16 +761,16 @@ namespace FireflyPet
 
         static void Handle(string raw)
         {
-            var d = Json.Parse(string.IsNullOrEmpty(raw) ? "{}" : raw) ?? new Dictionary<string, object>();
-            string ev = Json.Str(d, "hook_event_name");
+            var d = MiniJson.Parse(string.IsNullOrEmpty(raw) ? "{}" : raw) ?? new Dictionary<string, object>();
+            string ev = Str(d, "hook_event_name");
             if (ev == "") ev = "Unknown";
             var rec = new Dictionary<string, object>();
-            rec["ts"] = (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+            rec["ts"] = Program.StartMs;
             rec["ev"] = ev;
-            string sid = Json.Str(d, "session_id");
+            string sid = Str(d, "session_id");
             rec["sid"] = sid.Length > 36 ? sid.Substring(0, 36) : sid;
-            if (Json.Str(d, "cwd") != "") rec["cwd"] = Base(Json.Str(d, "cwd"));
-            string tool = Json.Str(d, "tool_name");
+            if (Str(d, "cwd") != "") rec["cwd"] = Base(Str(d, "cwd"));
+            string tool = Str(d, "tool_name");
             if (tool != "")
             {
                 rec["tool"] = tool;
@@ -566,17 +778,30 @@ namespace FireflyPet
                 d.TryGetValue("tool_input", out input);
                 string det = ToolDetail(tool, input as Dictionary<string, object>);
                 if (det != "") rec["detail"] = det;
+                if (tool == "Bash" || tool == "PowerShell")
+                {
+                    // 只看命令本身判断是不是测试/编译，桌宠据此在成功或失败时做反应
+                    string kind = CommandKind(Str(input as Dictionary<string, object>, "command"));
+                    if (kind != "") rec["kind"] = kind;
+                    object resp;
+                    var rd = d.TryGetValue("tool_response", out resp) ? resp as Dictionary<string, object> : null;
+                    foreach (var k in new[] { "exitCode", "exit_code", "returnCode" })
+                    {
+                        long code;
+                        if (long.TryParse(Str(rd, k), out code) && code != 0) rec["fail"] = 1;
+                    }
+                }
             }
-            if (Json.Str(d, "notification_type") != "") rec["ntype"] = Json.Str(d, "notification_type");
-            if (Json.Str(d, "message") != "") rec["msg"] = Short(Json.Str(d, "message"), 60);
-            if (Json.Str(d, "source") != "") rec["source"] = Json.Str(d, "source");
-            if (Json.Str(d, "reason") != "") rec["reason"] = Json.Str(d, "reason");
+            if (Str(d, "notification_type") != "") rec["ntype"] = Str(d, "notification_type");
+            if (Str(d, "message") != "") rec["msg"] = Short(Str(d, "message"), 60);
+            if (Str(d, "source") != "") rec["source"] = Str(d, "source");
+            if (Str(d, "reason") != "") rec["reason"] = Str(d, "reason");
             object err;
             if (d.TryGetValue("error", out err) && err != null)
-                rec["error"] = Short(err is string ? (string)err : Json.S.Serialize(err), 60);
-            if (Json.Str(d, "agent_type") != "") rec["agent"] = Json.Str(d, "agent_type");
+                rec["error"] = Short(err is string ? (string)err : MiniJson.Write(err), 60);
+            if (Str(d, "agent_type") != "") rec["agent"] = Str(d, "agent_type");
 
-            string line = Json.S.Serialize(rec) + "\n";
+            string line = MiniJson.Write(rec) + "\n";
             string file = System.IO.Path.Combine(Program.DataDir, "events.jsonl");
             try { if (new FileInfo(file).Length > MaxEventsBytes) TrimEvents(file); }
             catch (Exception e) { if (!(e is FileNotFoundException)) Program.Log("裁剪事件文件失败: " + e.Message); }
@@ -717,12 +942,14 @@ namespace FireflyPet
         public bool BreakReminder { get; set; }    // 连续工作太久提醒休息、深夜提醒早点睡
         public bool Sound { get; set; }            // 等你确认时轻响一声
         public bool Perch { get; set; }            // Lv.15：坐在当前窗口的顶边上
+        public bool Festive { get; set; }          // 节日特效
+        public string Birthday { get; set; }       // 你的生日 MM-dd，这天她放烟花
         public string Spritesheet { get; set; }
         public string PetName { get; set; }
 
         public Config()
         {
-            Scale = 0.7; AutoStart = true; FollowClaude = true; Bubbles = "all"; LookAtCursor = true; HideInFullscreen = true; SystemNotify = true; BreakReminder = true;
+            Scale = 0.7; AutoStart = true; FollowClaude = true; Bubbles = "all"; LookAtCursor = true; HideInFullscreen = true; SystemNotify = true; BreakReminder = true; Festive = true;
             Spritesheet = "firefly-spritesheet.png"; PetName = "流萤";
         }
     }
@@ -751,6 +978,7 @@ namespace FireflyPet
         public List<string> Achievements { get; set; }
         public List<DayStat> History { get; set; }            // 以前每天的数据，成长手册画最近 7 天
         public Dictionary<string, int> Treasures { get; set; } // 收藏品 → 收到几次
+        public string FestivalDay { get; set; }    // 哪天已经说过节日祝福
         public string NightCareDay { get; set; }   // 哪一晚已经提醒过早点睡
         public int AnniversaryShown { get; set; }  // 已经庆祝过的认识天数
 
@@ -1686,6 +1914,8 @@ namespace FireflyPet
                 CheckStale(DateTime.Now);
                 double idle = 0;
                 try { idle = Desk.IdleSeconds(); } catch { }
+                UpdateAway(idle);
+                CheckFestival(idle);
                 var want = TimeSpan.FromMilliseconds(idle > 300 && BaseState() == "idle" && !walking && !throwing ? 250 : 33);
                 if (tick.Interval != want) tick.Interval = want;
             };
@@ -2062,7 +2292,7 @@ namespace FireflyPet
             sharp.Click += (s, e) => { cfg.PixelSharp = !cfg.PixelSharp; ApplyScaling(); SaveConfig(); };
             m.Items.Add(sharp);
 
-            var care = new MenuItem { Header = "提醒与声音" };
+            var care = new MenuItem { Header = "提醒、声音与节日" };
             var notify = new MenuItem { Header = "系统通知（看不到我时提醒你）", IsCheckable = true, IsChecked = cfg.SystemNotify };
             notify.Click += (s, e) => { cfg.SystemNotify = !cfg.SystemNotify; SaveConfig(); };
             care.Items.Add(notify);
@@ -2081,6 +2311,12 @@ namespace FireflyPet
             var snd = new MenuItem { Header = "提示音（等你确认时）", IsCheckable = true, IsChecked = cfg.Sound };
             snd.Click += (s, e) => { cfg.Sound = !cfg.Sound; SaveConfig(); if (cfg.Sound) { lastChime = DateTime.MinValue; Chime(); } };
             care.Items.Add(snd);
+            var fest = new MenuItem { Header = "节日特效（春节、中秋、圣诞、生日…）", IsCheckable = true, IsChecked = cfg.Festive };
+            fest.Click += (s, e) => { cfg.Festive = !cfg.Festive; SaveConfig(); festDay = null; };
+            care.Items.Add(fest);
+            var bday = new MenuItem { Header = string.IsNullOrEmpty(cfg.Birthday) ? "我的生日…" : "我的生日（" + cfg.Birthday + "）…" };
+            bday.Click += (s, e) => AskBirthday();
+            care.Items.Add(bday);
             m.Items.Add(care);
 
             var auto = new MenuItem { Header = "随 Claude Code 自动出现", IsCheckable = true, IsChecked = cfg.AutoStart };
@@ -2134,6 +2370,7 @@ namespace FireflyPet
             UpdateOrbit();
             UpdateSparks();
             UpdateGlow(t);
+            UpdateAmbient(baseState);
 
             string want;
             if (dragging) want = dragDir > 0 ? "running-right" : dragDir < 0 ? "running-left" : "idle";
@@ -2739,6 +2976,7 @@ namespace FireflyPet
                 case "PreToolUse":
                     if (recent) s.State = "running";
                     if (talk) Say(ToolText(tool, detail), 0, 3000);
+                    if (talk) Beat();
                     break;
                 case "PostToolUse":
                     stats.Tools++;
@@ -2746,13 +2984,15 @@ namespace FireflyPet
                     CountWork(s, tool, detail);
                     if (recent) s.State = "running";
                     GainXp(Growth.XpTool, live);
+                    if (talk && Json.Str(d, "kind") != "") ToolResult(Json.Str(d, "kind"), Json.Num(d, "fail") != 0);
                     break;
                 case "PostToolUseFailure":
                     stats.Tools++;
                     if (today) stats.TodayTools++;
                     CountWork(s, tool, detail);
                     if (recent) s.State = "running";
-                    if (talk && DateTime.Now > failOverlayCooldown)
+                    if (talk && Json.Str(d, "kind") != "") ToolResult(Json.Str(d, "kind"), true);
+                    else if (talk && DateTime.Now > failOverlayCooldown)
                     {
                         failOverlayCooldown = DateTime.Now.AddSeconds(10);
                         Overlay("failed", 1);
@@ -2945,7 +3185,7 @@ namespace FireflyPet
         }
 
         // 飞出去的萤火：位置用动画，亮度每帧按进度换档位画刷（不用 Opacity 动画，见 AlphaSteps）
-        class Spark { public Ellipse E; public double Start, Dur; }
+        class Spark { public FrameworkElement E; public Brush[] Steps; public double Start, Dur; }
         readonly List<Spark> sparks = new List<Spark>();
 
         void UpdateSparks()
@@ -2957,8 +3197,10 @@ namespace FireflyPet
                 double p = (now - sp.Start) / sp.Dur;
                 if (p >= 1) { fx.Children.Remove(sp.E); sparks.RemoveAt(i); continue; }
                 double a = p <= 0 ? 0 : p < 0.25 ? p / 0.25 : p < 0.55 ? 1 - 0.3 * (p - 0.25) / 0.3 : 0.7 * (1 - (p - 0.55) / 0.45);
-                Brush b = Step(GlowSteps, a);
-                if (sp.E.Fill != b) sp.E.Fill = b;
+                Brush b = Step(sp.Steps ?? GlowSteps, a);
+                var sh = sp.E as Shape;
+                if (sh != null) { if (sh.Fill != b) sh.Fill = b; }
+                else { var tb = (TextBlock)sp.E; if (tb.Foreground != b) tb.Foreground = b; }
                 sp.E.Visibility = a > 0 ? Visibility.Visible : Visibility.Hidden;
             }
         }
@@ -2980,6 +3222,242 @@ namespace FireflyPet
                 e.BeginAnimation(Canvas.TopProperty, ay);
                 e.BeginAnimation(Canvas.LeftProperty, ax);
             }
+        }
+
+        // ------------------------------------------------------------ 打节拍、测试结果、离开打盹、节日
+
+        static readonly FontFamily SymbolFont = new FontFamily("Segoe UI Symbol");
+        static Brush[] GlowOf(Color c)
+        {
+            return Steps(a =>
+            {
+                var b = new RadialGradientBrush();
+                b.GradientStops.Add(new GradientStop(Fade(Color.FromArgb(0xFF, (byte)((c.R + 255) / 2), (byte)((c.G + 255) / 2), (byte)((c.B + 255) / 2)), a), 0));
+                b.GradientStops.Add(new GradientStop(Fade(Color.FromArgb(0xE8, c.R, c.G, c.B), a), 0.4));
+                b.GradientStops.Add(new GradientStop(Color.FromArgb(0, c.R, c.G, c.B), 1));
+                return b;
+            });
+        }
+        static readonly Brush[] GlowGold = GlowOf(Color.FromRgb(0xFF, 0xC8, 0x3A)), GlowRed = GlowOf(Color.FromRgb(0xFF, 0x4D, 0x4D)),
+            GlowPink = GlowOf(Color.FromRgb(0xFF, 0x6F, 0xB0)), GlowBlue = GlowOf(Color.FromRgb(0x4F, 0xB6, 0xFF)),
+            GlowPurple = GlowOf(Color.FromRgb(0xA8, 0x6B, 0xFF)), GlowOrange = GlowOf(Color.FromRgb(0xFF, 0x8C, 0x2E)),
+            GlowGreen = GlowOf(Color.FromRgb(0x5C, 0xD6, 0x5C));
+        static readonly Brush[][] Colorful = { GlowRed, GlowGold, GlowPink, GlowBlue, GlowPurple, GlowGreen };
+        static readonly Brush[] HeartInk = SolidSteps(Color.FromRgb(0xFF, 0x5E, 0x9C)), SnowInk = SolidSteps(Color.FromRgb(0x8E, 0xC8, 0xF2)),
+            ZInk = SolidSteps(Color.FromRgb(0x6F, 0x8F, 0xBF));
+
+        static Ellipse Dot(double size) { return new Ellipse { Width = size, Height = size }; }
+        static TextBlock Glyph(string text, double size) { return new TextBlock { Text = text, FontSize = size, FontWeight = FontWeights.Bold, FontFamily = SymbolFont }; }
+
+        // 一个从 (x0,y0) 飘到 (x1,y1) 的小东西；亮度按进度换档位画刷（同 Fireflies，不用 Opacity）
+        void Particle(FrameworkElement e, Brush[] steps, double x0, double y0, double x1, double y1, double dur, double delay, bool easeOut)
+        {
+            e.IsHitTestVisible = false;
+            e.Visibility = Visibility.Hidden;
+            Canvas.SetLeft(e, x0); Canvas.SetTop(e, y0);
+            fx.Children.Add(e);
+            var d = new Duration(TimeSpan.FromMilliseconds(dur));
+            var b = TimeSpan.FromMilliseconds(delay);
+            var ay = new DoubleAnimation(y0, y1, d) { BeginTime = b };
+            var ax = new DoubleAnimation(x0, x1, d) { BeginTime = b };
+            if (easeOut)
+            {
+                ay.EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut };
+                ax.EasingFunction = new QuadraticEase { EasingMode = EasingMode.EaseOut };
+            }
+            sparks.Add(new Spark { E = e, Steps = steps, Start = clock.Elapsed.TotalMilliseconds + delay, Dur = dur });
+            e.BeginAnimation(Canvas.TopProperty, ay);
+            e.BeginAnimation(Canvas.LeftProperty, ax);
+        }
+
+        void Firework(double x, double y, Brush[] steps, int n, double delay)
+        {
+            double k = Math.Max(scale, 0.6);
+            for (int i = 0; i < n; i++)
+            {
+                double ang = 2 * Math.PI * i / n + rnd.NextDouble() * 0.3, r = (36 + rnd.Next(16)) * k;
+                Particle(Dot(7 * k), steps, x, y, x + Math.Cos(ang) * r, y + Math.Sin(ang) * r, 900 + rnd.Next(300), delay, true);
+            }
+        }
+
+        void FireworkShow()
+        {
+            for (int j = 0; j < 3; j++)
+                Firework(spriteW * (0.2 + 0.6 * rnd.NextDouble()), spriteH * (0.05 + 0.25 * rnd.NextDouble()), Colorful[rnd.Next(Colorful.Length)], 12, j * 380);
+        }
+
+        void Confetti(int n)
+        {
+            double k = Math.Max(scale, 0.6), x0 = spriteW * 0.5, y0 = spriteH * 0.5;
+            for (int i = 0; i < n; i++)
+                Particle(Dot(7 * k), Colorful[i % Colorful.Length], x0, y0, x0 + (rnd.NextDouble() - 0.5) * spriteW * 0.9, y0 - spriteH * (0.3 + 0.4 * rnd.NextDouble()), 1000 + rnd.Next(400), i * 30, true);
+        }
+
+        // 跟着工具调用打节拍：工作动作立刻换到下一帧，手边蹦出一颗小光点
+        double lastBeat;
+        void Beat()
+        {
+            double now = clock.Elapsed.TotalMilliseconds;
+            if (now - lastBeat < 150 || !IsVisible) return;
+            lastBeat = now;
+            Anim a;
+            if (!overlay.HasValue && !dragging && !walking && Anims.TryGetValue(curAnim, out a) && frameIdx < a.Dur.Length)
+                frameElapsed = Math.Max(frameElapsed, a.Dur[frameIdx]);
+            double k = Math.Max(scale, 0.6), x = spriteW * (0.35 + 0.3 * rnd.NextDouble()), y = spriteH * 0.58;
+            Particle(Dot(6 * k), GlowGold, x, y, x + (rnd.NextDouble() - 0.5) * 24 * k, y - 26 * k, 600, 0, true);
+        }
+
+        // 测试/编译命令跑完：通过就撒彩色萤火，没过就着急一下
+        DateTime passCooldown = DateTime.MinValue;
+        void ToolResult(string kind, bool fail)
+        {
+            string what = kind == "test" ? "测试" : "编译";
+            if (fail)
+            {
+                if (DateTime.Now < failOverlayCooldown) return;
+                failOverlayCooldown = DateTime.Now.AddSeconds(10);
+                Overlay("failed", 1);
+                Say(what + "没过…别急，一起看看哪里不对。", 1, 3500);
+                return;
+            }
+            if (DateTime.Now < passCooldown) return;
+            passCooldown = DateTime.Now.AddSeconds(20);
+            Overlay("jumping", 1);
+            Confetti(14);
+            Say(kind == "test" ? "测试全过啦！" : "编译通过～", 1, 3000);
+        }
+
+        // 你离开 5 分钟以上：她打盹冒 Zzz；你一回来就招手，告诉你离开了多久、这段时间 Claude 完成了几个任务
+        const int AwaySeconds = 300;
+        bool away;
+        DateTime awaySince;
+        long awayCompletes;
+        void UpdateAway(double idle)
+        {
+            DateTime now = DateTime.Now;
+            if (!away)
+            {
+                if (idle >= AwaySeconds) { away = true; awaySince = now.AddSeconds(-idle); awayCompletes = stats.Completes; }
+                return;
+            }
+            if (idle >= 3) return;
+            away = false;
+            if (!IsVisible || bubbleSticky) return; // 正在等你确认的那条更要紧
+            long sec = (long)(now - awaySince).TotalSeconds, done = stats.Completes - awayCompletes;
+            Overlay("waving", 2);
+            Say("回来啦～你离开了 " + Growth.Duration(sec) + (done > 0 ? "，这段时间 Claude 完成了 " + done + " 个任务" : "") + "。", 1, 5000, true);
+        }
+
+        string festDay, festKind, festGreet;
+        void CheckFestival(double idle)
+        {
+            string today = Program.Today.ToString("yyyy-MM-dd");
+            if (today != festDay)
+            {
+                festDay = today; festKind = null; festGreet = null;
+                if (cfg.Festive) Festival.Find(Program.Today, cfg.Birthday, out festKind, out festGreet);
+                nextAmbient = 0;
+            }
+            if (festKind == null || stats.FestivalDay == today || !IsVisible || idle > 60 || bubbleSticky || DateTime.Now < bubbleUntil || dragging) return;
+            stats.FestivalDay = today;
+            statsDirty = true;
+            SaveStats();
+            Overlay("waving", 2);
+            FireworkShow();
+            Say(festGreet, 1, 6000, true);
+        }
+
+        // 每帧看一眼：打盹时冒 Zzz，节日里飘雪、飘爱心、放烟花
+        double nextAmbient;
+        int zCount;
+        void UpdateAmbient(string baseState)
+        {
+            double now = clock.Elapsed.TotalMilliseconds;
+            if (now < nextAmbient || dragging || throwing) return;
+            double k = Math.Max(scale, 0.6), W = spriteW, H = spriteH;
+            if (away && baseState == "idle" && !walking)
+            {
+                int z = zCount++ % 3;
+                Particle(Glyph(z == 2 ? "Z" : "z", (10 + 4 * z) * k), ZInk, W * 0.6, H * 0.3, W * 0.6 + 26 * k, H * 0.3 - 44 * k, 2600, 0, true);
+                nextAmbient = now + (z == 2 ? 2600 : 900);
+                return;
+            }
+            nextAmbient = now + 1000;
+            if (festKind == null) return;
+            double x = W * rnd.NextDouble();
+            switch (festKind)
+            {
+                case "snow":
+                    Particle(Glyph("❄", (9 + rnd.Next(6)) * k), SnowInk, x, -0.2 * H, x + (rnd.NextDouble() - 0.5) * 30 * k, 0.95 * H, 4000 + rnd.Next(1500), 0, false);
+                    nextAmbient = now + 700;
+                    break;
+                case "hearts":
+                    x = W * (0.3 + 0.4 * rnd.NextDouble());
+                    Particle(Glyph("♥", (12 + rnd.Next(6)) * k), HeartInk, x, 0.45 * H, x + (rnd.NextDouble() - 0.5) * 40 * k, -0.2 * H, 2400, 0, true);
+                    nextAmbient = now + 2500;
+                    break;
+                case "lanterns":
+                case "moon":
+                    Particle(Dot((10 + rnd.Next(5)) * k), festKind == "moon" ? GlowGold : (rnd.Next(2) == 0 ? GlowOrange : GlowRed), x, 0.85 * H, x + (rnd.NextDouble() - 0.5) * 30 * k, -0.2 * H, 4200, 0, false);
+                    nextAmbient = now + 2200;
+                    break;
+                case "spooky":
+                    Particle(Dot(8 * k), rnd.Next(2) == 0 ? GlowPurple : GlowOrange, x, 0.7 * H, x + (rnd.NextDouble() - 0.5) * 80 * k, 0.1 * H, 2600, 0, true);
+                    nextAmbient = now + 1800;
+                    break;
+                case "leaves":
+                    Particle(Dot(8 * k), GlowGreen, x, 0.8 * H, x + (rnd.NextDouble() - 0.5) * 50 * k, 0.05 * H, 3000, 0, true);
+                    nextAmbient = now + 2000;
+                    break;
+                case "fireworks":
+                    FireworkShow();
+                    nextAmbient = now + 15000;
+                    break;
+                case "birthday":
+                    if (rnd.Next(2) == 0) FireworkShow(); else Confetti(14);
+                    nextAmbient = now + 12000;
+                    break;
+            }
+        }
+
+        void AskBirthday()
+        {
+            var w = new Window { Title = "我的生日", SizeToContent = SizeToContent.WidthAndHeight, ResizeMode = ResizeMode.NoResize, WindowStartupLocation = WindowStartupLocation.CenterScreen, Topmost = true };
+            var sp = new StackPanel { Margin = new Thickness(18) };
+            sp.Children.Add(new TextBlock { Text = "设好后，生日那天她会放烟花给你庆祝。", Margin = new Thickness(0, 0, 0, 12) });
+            var row = new StackPanel { Orientation = Orientation.Horizontal };
+            var mon = new ComboBox { Width = 64 };
+            var day = new ComboBox { Width = 64 };
+            for (int i = 1; i <= 12; i++) mon.Items.Add(i);
+            for (int i = 1; i <= 31; i++) day.Items.Add(i);
+            int bm = 0, bd = 0;
+            if (!string.IsNullOrEmpty(cfg.Birthday) && cfg.Birthday.Length == 5) { int.TryParse(cfg.Birthday.Substring(0, 2), out bm); int.TryParse(cfg.Birthday.Substring(3, 2), out bd); }
+            mon.SelectedIndex = (bm >= 1 && bm <= 12 ? bm : DateTime.Today.Month) - 1;
+            day.SelectedIndex = (bd >= 1 && bd <= 31 ? bd : DateTime.Today.Day) - 1;
+            row.Children.Add(mon);
+            row.Children.Add(new TextBlock { Text = " 月   ", VerticalAlignment = VerticalAlignment.Center });
+            row.Children.Add(day);
+            row.Children.Add(new TextBlock { Text = " 日", VerticalAlignment = VerticalAlignment.Center });
+            sp.Children.Add(row);
+            var btns = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 16, 0, 0) };
+            var ok = new Button { Content = "保存", Width = 68, IsDefault = true };
+            var clear = new Button { Content = "清除", Width = 68, Margin = new Thickness(8, 0, 0, 0) };
+            ok.Click += (s, e) =>
+            {
+                int mm = (int)mon.SelectedItem, dd = Math.Min((int)day.SelectedItem, DateTime.DaysInMonth(2024, mm));
+                cfg.Birthday = mm.ToString("00") + "-" + dd.ToString("00");
+                SaveConfig();
+                festDay = null;
+                w.Close();
+                Say("记住啦，" + mm + " 月 " + dd + " 日～", 1, 3000, true);
+            };
+            clear.Click += (s, e) => { cfg.Birthday = null; SaveConfig(); festDay = null; w.Close(); };
+            btns.Children.Add(ok);
+            btns.Children.Add(clear);
+            sp.Children.Add(btns);
+            w.Content = sp;
+            w.Show();
+            w.Activate();
         }
 
         // ------------------------------------------------------------ 甩出去：松手时还在快速移动，就飞出去落到屏幕底部
