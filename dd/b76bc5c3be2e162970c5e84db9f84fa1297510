@@ -1,0 +1,35 @@
+tests/mem_host.cs
+  s_021c5d0d3c7199::t_bd4a1ff2ade887 5,88-98
+tests/t_hook.py
+  s_021c5d0d3c7199::t_144c82566af120 52
+  s_021c5d0d3c7199::t_2a356a2e8c3ec7 1-51,53-85
+src/FireflyPet.cs
+  s_021c5d0d3c7199::t_e001379f841bae 39-42,64-68,104-110,492-669,711,725-743,764-765,768,770,772-773,781-793,795-798,801-802,804,945-946,952,981,1917-1918,2295,2314-2319,2373,2979,2987,2994-2995,3188,3200-3203,3227-3461
+  s_021c5d0d3c7199::t_c58e6f3fb20ff8 3462
+plugins/firefly-pet/.claude-plugin/plugin.json
+  s_021c5d0d3c7199::t_168ef28436efd0 3
+tests/t_fun.ps1
+  s_021c5d0d3c7199::t_a0c83e12a4895a 61
+  s_021c5d0d3c7199::t_fdf42474e18064 1-52,55-60,62-91,93-95,97-101
+  s_021c5d0d3c7199::t_097e27a9671351 53-54,92,96
+README.md
+  s_021c5d0d3c7199::t_168ef28436efd0 31-35,73,93-94,99,101
+plugins/firefly-pet/hooks/hooks.json
+  s_021c5d0d3c7199::t_e001379f841bae 10-11,33-34,84-85,109-110,121-122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5+huawei.3",
+  "base_commit_sha": "ddb76bc5c3be2e162970c5e84db9f84fa1297510",
+  "prompts": {},
+  "sessions": {
+    "s_021c5d0d3c7199": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "240c17a4-a5c5-40d5-a21a-f7a23e479eaa",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "dxandtom <x7730716@gmail.com>"
+    }
+  }
+}
