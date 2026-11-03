@@ -800,6 +800,7 @@ namespace FireflyPet
             if (d.TryGetValue("error", out err) && err != null)
                 rec["error"] = Short(err is string ? (string)err : MiniJson.Write(err), 60);
             if (Str(d, "agent_type") != "") rec["agent"] = Str(d, "agent_type");
+            if ((ev == "Stop" || ev == "SessionStart") && Str(d, "transcript_path") != "") rec["tp"] = Str(d, "transcript_path");
 
             string line = MiniJson.Write(rec) + "\n";
             string file = System.IO.Path.Combine(Program.DataDir, "events.jsonl");
@@ -944,13 +945,14 @@ namespace FireflyPet
         public bool Perch { get; set; }            // Lv.15：坐在当前窗口的顶边上
         public bool Festive { get; set; }          // 节日特效
         public string Birthday { get; set; }       // 你的生日 MM-dd，这天她放烟花
+        public bool CtxBar { get; set; }           // 脚下显示当前会话的上下文体力条
         public string Spritesheet { get; set; }
         public string PetName { get; set; }
 
         public Config()
         {
             Scale = 0.7; AutoStart = true; FollowClaude = true; Bubbles = "all"; LookAtCursor = true; HideInFullscreen = true; SystemNotify = true; BreakReminder = true; Festive = true;
-            Spritesheet = "firefly-spritesheet.png"; PetName = "流萤";
+            Spritesheet = "firefly-spritesheet.png"; PetName = "流萤"; CtxBar = true;
         }
     }
 
@@ -979,6 +981,9 @@ namespace FireflyPet
         public List<DayStat> History { get; set; }            // 以前每天的数据，成长手册画最近 7 天
         public Dictionary<string, int> Treasures { get; set; } // 收藏品 → 收到几次
         public string FestivalDay { get; set; }    // 哪天已经说过节日祝福
+        public int TodayPlayXp { get; set; }       // 今天玩耍（接光球、小游戏）得的经验
+        public int Balls { get; set; }             // 一共接住几次光球
+        public int GameBest { get; set; }          // 接萤火小游戏最高分
         public string NightCareDay { get; set; }   // 哪一晚已经提醒过早点睡
         public int AnniversaryShown { get; set; }  // 已经庆祝过的认识天数
 
@@ -1329,7 +1334,7 @@ namespace FireflyPet
         public static long TotalXp(int level) { return 40L * (level - 1) + 10L * (level - 1) * (level - 2); }
 
         // 各行为给的经验（事件处理和成长手册共用）
-        public const int XpComplete = 10, XpPrompt = 3, XpSubagent = 2, XpTool = 1, XpPat = 1, PatsPerDay = 20;
+        public const int XpComplete = 10, XpPrompt = 3, XpSubagent = 2, XpTool = 1, XpPat = 1, PatsPerDay = 20, PlayXpPerDay = 10;
         public const int XpClaudeTime = 2, ClaudeXpMinutes = 10, ClaudeXpPerDay = 12; // 一起待 10 分钟 +2，每天最多算 2 小时
 
         public static string Duration(long sec)
@@ -1514,6 +1519,7 @@ namespace FireflyPet
             xp.Children.Add(XpRow("子代理（subagent）完成一次", "+" + Growth.XpSubagent));
             xp.Children.Add(XpRow("工具调用成功一次", "+" + Growth.XpTool));
             xp.Children.Add(XpRow("摸头（点她一下）", "+" + Growth.XpPat + "，每天最多 " + Growth.PatsPerDay + " 次"));
+            xp.Children.Add(XpRow("玩耍（接光球、接萤火小游戏）", "接住光球 +1，小游戏每 3 分 +1，每天最多 " + Growth.PlayXpPerDay));
             xp.Children.Add(XpRow("和 Claude 一起待 " + Growth.ClaudeXpMinutes + " 分钟（桌面端或终端里的 Claude Code）", "+" + Growth.XpClaudeTime + "，每天最多 " + Growth.ClaudeXpMinutes * Growth.ClaudeXpPerDay / 60 + " 小时"));
             xp.Children.Add(Text("出错、等你授权、开会话不加经验。桌宠没开时发生的事件会在下次启动时补算。", 11.5, FontWeights.Normal, Muted, 6));
             Body.Children.Add(CardOf(xp));
@@ -1746,6 +1752,9 @@ namespace FireflyPet
         public HashSet<string> Files = new HashSet<string>(); // 这一轮改过的文件
         public int Commands;            // 这一轮跑过的命令
         public int Subagents;           // 正在跑的子代理（身边绕着的小萤火）
+        public string Transcript = "";  // 会话记录文件，只用来读末尾的 token 数
+        public long CtxTokens;          // 最近一次回复时上下文用了多少 token（0 = 还不知道）
+        public bool CtxWarned;          // 这次快满已经提醒过
     }
 
     // ---------------------------------------------------------------- 窗口
@@ -1906,7 +1915,8 @@ namespace FireflyPet
             var tick = new DispatcherTimer(DispatcherPriority.Render) { Interval = TimeSpan.FromMilliseconds(33) };
             tick.Tick += (s, e) => Tick();
             tick.Start();
-            IsVisibleChanged += (s, e) => tick.IsEnabled = IsVisible;
+            IsVisibleChanged += (s, e) => { tick.IsEnabled = IsVisible; if (!IsVisible) { EndBall(); EndGame(false); } };
+            Closed += (s, e) => CloseFloats();
             // 换日、计时、会话超时这些不看画面，每秒一次，藏起来也照常
             var stale = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
             stale.Tick += (s, e) =>
@@ -1916,7 +1926,9 @@ namespace FireflyPet
                 try { idle = Desk.IdleSeconds(); } catch { }
                 UpdateAway(idle);
                 CheckFestival(idle);
-                var want = TimeSpan.FromMilliseconds(idle > 300 && BaseState() == "idle" && !walking && !throwing ? 250 : 33);
+                CheckLines();
+                UpdateCtxChip();
+                var want = TimeSpan.FromMilliseconds(idle > 300 && BaseState() == "idle" && !walking && !throwing && !ballOn && !gameOn ? 250 : 33);
                 if (tick.Interval != want) tick.Interval = want;
             };
             stale.Start();
@@ -2103,6 +2115,7 @@ namespace FireflyPet
             chip.MouseLeftButtonUp += (s, e) => { OpenSessions(); e.Handled = true; };
             Grid.SetRow(chip, 2);
             root.Children.Add(chip);
+            BuildCtxChip();
             UpdateBadge();
             badge.IsHitTestVisible = true;
             badge.Cursor = Cursors.Hand;
@@ -2248,6 +2261,18 @@ namespace FireflyPet
             var sess = new MenuItem { Header = "会话一览（" + SessionRows().Count + " 个进行中）…" };
             sess.Click += (s, e) => OpenSessions();
             m.Items.Add(sess);
+            var play = new MenuItem { Header = "陪她玩" };
+            var ballItem = new MenuItem { Header = perched ? "扔个光球（坐在窗口上时不行）" : "扔个光球给她（也可以拖着光球甩）", IsEnabled = !perched && !gameOn };
+            ballItem.Click += (s, e) => ThrowBall();
+            play.Items.Add(ballItem);
+            var gameItem = new MenuItem { Header = "接萤火小游戏（30 秒，最高 " + stats.GameBest + " 分）", IsEnabled = !perched && !gameOn };
+            gameItem.Click += (s, e) => StartGame();
+            play.Items.Add(gameItem);
+            play.Items.Add(new Separator());
+            var linesItem = new MenuItem { Header = "编辑我的台词…" };
+            linesItem.Click += (s, e) => EditLines();
+            play.Items.Add(linesItem);
+            m.Items.Add(play);
             m.Items.Add(new Separator());
 
             var size = new MenuItem { Header = "大小" };
@@ -2273,6 +2298,10 @@ namespace FireflyPet
             var look = new MenuItem { Header = "视线跟随鼠标", IsCheckable = true, IsChecked = cfg.LookAtCursor };
             look.Click += (s, e) => { cfg.LookAtCursor = !cfg.LookAtCursor; SaveConfig(); };
             m.Items.Add(look);
+
+            var ctx = new MenuItem { Header = "上下文体力条（会话快满时提醒）", IsCheckable = true, IsChecked = cfg.CtxBar };
+            ctx.Click += (s, e) => { cfg.CtxBar = !cfg.CtxBar; SaveConfig(); UpdateCtxChip(); };
+            m.Items.Add(ctx);
 
             bool canWander = lv >= Growth.WanderLevel;
             var wander = new MenuItem { Header = canWander ? "散步模式" : "散步模式（Lv." + Growth.WanderLevel + " 解锁）", IsCheckable = true, IsChecked = cfg.Wander && canWander, IsEnabled = canWander };
@@ -2364,6 +2393,8 @@ namespace FireflyPet
 
             string baseState = BaseState();
             UpdateLook(t, baseState);
+            UpdateBall(dt);
+            UpdateGame(dt);
             UpdateWander(t, dt, baseState);
             UpdateThrow(dt);
             UpdatePerch(t);
@@ -2519,7 +2550,7 @@ namespace FireflyPet
                 stats.History.Add(new DayStat { Day = old, Completes = stats.TodayCompletes, Tools = stats.TodayTools, Prompts = stats.TodayPrompts, ClaudeSeconds = stats.TodayClaudeSeconds });
                 if (stats.History.Count > 400) stats.History.RemoveRange(0, stats.History.Count - 400); // 够画「今年」
             }
-            stats.Today = today; stats.TodayCompletes = 0; stats.TodayPats = 0; stats.TodayPrompts = 0; stats.TodayTools = 0; stats.TodayClaudeSeconds = 0;
+            stats.Today = today; stats.TodayCompletes = 0; stats.TodayPats = 0; stats.TodayPlayXp = 0; stats.TodayPrompts = 0; stats.TodayTools = 0; stats.TodayClaudeSeconds = 0;
             statsDirty = true;
         }
 
@@ -2737,13 +2768,15 @@ namespace FireflyPet
 
         void UpdateWander(DateTime t, double dt, string baseState)
         {
-            bool allowed = cfg.Wander && Growth.Level(stats.Xp) >= Growth.WanderLevel && !dragging && !throwing && !perched && baseState == "idle" && !overlay.HasValue;
+            bool free = dodging || ballOn;
+            bool allowed = free ? !dragging && !throwing && !perched
+                : cfg.Wander && Growth.Level(stats.Xp) >= Growth.WanderLevel && !dragging && !throwing && !perched && baseState == "idle" && !overlay.HasValue && !gameOn;
             if (walking)
             {
-                if (!allowed) { walking = false; SavePos(); return; }
-                double step = 70 * dt / 1000 * Math.Max(scale, 0.6) / 0.7;
+                if (!allowed) { walking = false; dodging = false; SavePos(); return; }
+                double step = 70 * dt / 1000 * Math.Max(scale, 0.6) / 0.7 * (free ? 3.2 : 1);
                 double d = walkTarget - Left;
-                if (Math.Abs(d) <= step) { Left = walkTarget; walking = false; SavePos(); nextWander = t.AddSeconds(25 + rnd.Next(40)); }
+                if (Math.Abs(d) <= step) { Left = walkTarget; walking = false; dodging = false; if (!ballOn) SavePos(); nextWander = t.AddSeconds(25 + rnd.Next(40)); }
                 else Left += Math.Sign(d) * step;
                 return;
             }
@@ -2795,7 +2828,7 @@ namespace FireflyPet
             {
                 dragging = false; dragDir = 0;
                 if (perched) { perchSkip = perchWnd; perched = false; } // 从窗口上拖下来：不再坐这个窗口
-                if (!TryThrow()) SavePos();
+                if (gameOn || !TryThrow()) SavePos(); // 小游戏里拖着她接萤火，松手不甩出去
             }
             else OnClick();
             e.Handled = true;
@@ -2833,11 +2866,12 @@ namespace FireflyPet
                 Say("去吧～Claude 这边有我盯着。", 1, 3000, true);
                 return;
             }
+            if (CheckPoke()) return;
             stats.Pats++;
             if (stats.TodayPats < Growth.PatsPerDay) { stats.TodayPats++; GainXp(Growth.XpPat, true); }
             statsDirty = true;
             Overlay("jumping", 1);
-            if (!MaybeSummary()) Say(Growth.RandomLine(Growth.Level(stats.Xp), rnd), 1, 3000, true);
+            if (!MaybeSummary()) Say(MyLine("摸头", Growth.RandomLine(Growth.Level(stats.Xp), rnd)), 1, 3000, true);
             CheckFeats(true);
         }
 
@@ -2947,6 +2981,7 @@ namespace FireflyPet
             RollDay();
             bool today = when.ToString("yyyy-MM-dd") == stats.Today;
             if (Json.Str(d, "cwd") != "") s.Project = Json.Str(d, "cwd");
+            if (Json.Str(d, "tp") != "") s.Transcript = Json.Str(d, "tp");
             if (fresh) s.StuckWarned = false;
 
             switch (ev)
@@ -2955,6 +2990,7 @@ namespace FireflyPet
                 {
                     string src = Json.Str(d, "source");
                     if (src == "startup") stats.Sessions++;
+                    if (fresh && (src == "compact" || src == "clear")) { s.CtxTokens = 0; s.CtxWarned = false; }
                     if (recent) s.State = "idle";
                     if (talk && src != "compact")
                     {
@@ -3046,6 +3082,7 @@ namespace FireflyPet
                     if (when.Hour < 5) Unlock("night_owl", live);
                     else if (when.Hour >= 5 && when.Hour < 8) Unlock("early_bird", live);
                     if (recent) s.State = "review";
+                    if (recent && s.Transcript != "") RefreshCtx(s, talk);
                     var span = TimeSpan.Zero;
                     if (fresh && s.PromptAt.HasValue && when > s.PromptAt.Value)
                     {
@@ -3058,7 +3095,7 @@ namespace FireflyPet
                     {
                         Overlay("jumping", 1);
                         string[] done = { "完成啦！来看看吧～", "做好了，要检查一下吗？", "搞定～等你验收哦。" };
-                        string doneText = ProjectTag(s) + done[rnd.Next(done.Length)] + took;
+                        string doneText = ProjectTag(s) + MyLine("完成", done[rnd.Next(done.Length)]) + took;
                         Say(doneText + "  +" + Growth.XpComplete + " XP", 1, 5000);
                         Notify("任务完成", doneText);
                         if (Growth.Level(stats.Xp) >= Growth.FirefliesLevel) Fireflies(7);
@@ -3460,6 +3497,476 @@ namespace FireflyPet
             w.Activate();
         }
 
+        // ------------------------------------------------------------ 自定义台词：数据目录下的 lines.txt，保存后几秒内生效
+
+        Dictionary<string, List<string>> myLines = new Dictionary<string, List<string>>();
+        DateTime linesStamp = DateTime.MinValue, linesCheck = DateTime.MinValue;
+        static string LinesFile { get { return System.IO.Path.Combine(Program.DataDir, "lines.txt"); } }
+
+        const string LinesTemplate =
+            "# " + "流萤的自定义台词。每行一句，写在对应的 [分组] 下面；# 开头的是注释，不会说出来。\r\n" +
+            "# 保存后几秒内就生效，不用重启。你写的台词和自带的各占一半机会。\r\n" +
+            "\r\n" +
+            "[摸头]\r\n" +
+            "# 点她一下时说，例如：\r\n" +
+            "# 今天也辛苦啦～\r\n" +
+            "\r\n" +
+            "[完成]\r\n" +
+            "# Claude 完成一轮任务时说（前面自动加项目名，后面加耗时），例如：\r\n" +
+            "# 搞定！奖励自己一杯奶茶吧～\r\n" +
+            "\r\n" +
+            "[连戳]\r\n" +
+            "# 短时间连续点她好几下时说，说完她会躲开，例如：\r\n" +
+            "# 别戳啦，痒～\r\n";
+
+        public static Dictionary<string, List<string>> ParseLines(IEnumerable<string> lines)
+        {
+            var d = new Dictionary<string, List<string>>();
+            List<string> cur = null;
+            foreach (var raw in lines)
+            {
+                string l = (raw ?? "").Trim();
+                if (l == "" || l.StartsWith("#")) continue;
+                if (l.StartsWith("[") && l.EndsWith("]"))
+                {
+                    string k = l.Substring(1, l.Length - 2).Trim();
+                    if (!d.TryGetValue(k, out cur)) d[k] = cur = new List<string>();
+                    continue;
+                }
+                if (cur != null) cur.Add(l.Length > 80 ? l.Substring(0, 80) : l);
+            }
+            return d;
+        }
+
+        void CheckLines()
+        {
+            if (DateTime.Now < linesCheck) return;
+            linesCheck = DateTime.Now.AddSeconds(3);
+            DateTime st = DateTime.MinValue;
+            try { if (File.Exists(LinesFile)) st = File.GetLastWriteTimeUtc(LinesFile); } catch { }
+            if (st == linesStamp) return;
+            try { myLines = st == DateTime.MinValue ? new Dictionary<string, List<string>>() : ParseLines(File.ReadAllLines(LinesFile)); linesStamp = st; }
+            catch (Exception e) { Program.Log("读取台词文件失败: " + e.Message); } // 记事本正在保存，下次再读
+        }
+
+        // 你写了这一组台词时，一半机会用你的
+        string MyLine(string key, string fallback)
+        {
+            List<string> l;
+            if (myLines.TryGetValue(key, out l) && l.Count > 0 && rnd.Next(2) == 0) return l[rnd.Next(l.Count)];
+            return fallback;
+        }
+
+        void EditLines()
+        {
+            try
+            {
+                if (!File.Exists(LinesFile)) File.WriteAllText(LinesFile, LinesTemplate, new UTF8Encoding(true));
+                Process.Start("notepad.exe", "\"" + LinesFile + "\"");
+                Say("写好保存就行，我马上就会说～", 1, 3000, true);
+            }
+            catch (Exception e) { Program.Log("打开台词文件失败: " + e.Message); Say("台词文件打不开…", 1, 3000, true); }
+        }
+
+        // ------------------------------------------------------------ 连戳：2.5 秒内点她 5 下，她嘟囔一句，往远离鼠标的方向跑开
+
+        readonly Queue<DateTime> pokes = new Queue<DateTime>();
+        bool dodging;
+        static readonly string[] PokeLines = { "别、别戳啦！", "哼，不理你了～", "好痒…我躲远一点！", "再戳我就跑啦！" };
+
+        bool CheckPoke()
+        {
+            var now = DateTime.Now;
+            pokes.Enqueue(now);
+            while (pokes.Count > 0 && (now - pokes.Peek()).TotalSeconds > 2.5) pokes.Dequeue();
+            if (pokes.Count < 5) return false;
+            pokes.Clear();
+            Say(MyLine("连戳", PokeLines[rnd.Next(PokeLines.Length)]), 1, 2500, true);
+            if (perched || throwing || gameOn || ballOn) { Overlay("failed", 1); return true; }
+            var wa = MyWorkArea();
+            double minX = wa.Left - (Width - spriteW) / 2, maxX = wa.Right - Width + (Width - spriteW) / 2;
+            double dir = CursorDip().X < Left + Width / 2 ? 1 : -1;
+            double dist = 170 + rnd.Next(90);
+            double target = Math.Max(minX, Math.Min(maxX, Left + dir * dist));
+            if (Math.Abs(target - Left) < 60) target = Math.Max(minX, Math.Min(maxX, Left - dir * dist)); // 那边是屏幕边，往另一边跑
+            walkTarget = target; walking = true; dodging = true;
+            return true;
+        }
+
+        // ------------------------------------------------------------ 上下文体力条：只读会话记录末尾那条回复里的 token 数，不看聊天内容
+
+        Border ctxChip; Rectangle ctxFill; TextBlock ctxText; string ctxTip = "";
+        Session ctxWarnSession; DateTime ctxWarnAt;
+        static readonly Brush CtxGreen = Frozen(Color.FromRgb(0x7F, 0xE6, 0xC8)), CtxYellow = Frozen(Color.FromRgb(0xFF, 0xD5, 0x6A)), CtxRed = Frozen(Color.FromRgb(0xFF, 0x6B, 0x6B));
+        static Brush Frozen(Color c) { var b = new SolidColorBrush(c); b.Freeze(); return b; }
+
+        void BuildCtxChip()
+        {
+            ctxText = new TextBlock { FontFamily = new FontFamily("Microsoft YaHei UI"), FontSize = 9, FontWeight = FontWeights.Bold, Foreground = Brushes.White, VerticalAlignment = VerticalAlignment.Center };
+            var bg = new Grid { Width = 22, Height = 3.5, Background = new SolidColorBrush(Color.FromArgb(0x55, 0xFF, 0xFF, 0xFF)), Margin = new Thickness(4, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center };
+            ctxFill = new Rectangle { HorizontalAlignment = HorizontalAlignment.Left, Width = 0 };
+            bg.Children.Add(ctxFill);
+            var sp = new StackPanel { Orientation = Orientation.Horizontal };
+            sp.Children.Add(ctxText);
+            sp.Children.Add(bg);
+            ctxChip = new Border
+            {
+                Child = sp, CornerRadius = new CornerRadius(7), Padding = new Thickness(5, 1, 5, 2),
+                Background = new SolidColorBrush(Color.FromArgb(0xB0, 0x1E, 0x26, 0x2C)),
+                HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Top,
+                RenderTransform = new TranslateTransform(-60, 0), Visibility = Visibility.Collapsed,
+            };
+            Grid.SetRow(ctxChip, 2);
+            root.Children.Add(ctxChip);
+        }
+
+        // 窗口按 200K 算；用量已经超过 200K 的会话一定是 1M 窗口
+        public static int CtxPercent(long tokens)
+        {
+            long w = tokens > 200000 ? 1000000 : 200000;
+            return (int)Math.Min(100, tokens * 100 / w);
+        }
+
+        // 从会话记录末尾往前找最后一条带 usage 的回复，加起来就是那一刻的上下文大小；读不到返回 0
+        public static long ContextTokens(string path)
+        {
+            try
+            {
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                {
+                    long len = fs.Length, start = Math.Max(0, len - 512 * 1024);
+                    fs.Seek(start, SeekOrigin.Begin);
+                    var buf = new byte[len - start];
+                    int n = 0;
+                    while (n < buf.Length) { int r = fs.Read(buf, n, buf.Length - n); if (r <= 0) break; n += r; }
+                    var lines = Encoding.UTF8.GetString(buf, 0, n).Split('\n');
+                    for (int i = lines.Length - 1; i >= (start > 0 ? 1 : 0); i--) // 截断的第一行不完整，跳过
+                    {
+                        string l = lines[i];
+                        int u = l.LastIndexOf("\"usage\":{", StringComparison.Ordinal);
+                        if (u < 0 || l.IndexOf("\"type\":\"assistant\"", StringComparison.Ordinal) < 0) continue;
+                        if (l.IndexOf("\"isSidechain\":true", StringComparison.Ordinal) >= 0) continue;
+                        string us = l.Substring(u);
+                        long sum = Tok(us, "input_tokens") + Tok(us, "cache_creation_input_tokens") + Tok(us, "cache_read_input_tokens") + Tok(us, "output_tokens");
+                        if (sum > 0) return sum;
+                    }
+                }
+            }
+            catch (Exception e) { if (!(e is FileNotFoundException || e is DirectoryNotFoundException)) Program.Log("读取上下文用量失败: " + e.Message); }
+            return 0;
+        }
+
+        static long Tok(string s, string key)
+        {
+            var m = System.Text.RegularExpressions.Regex.Match(s, "\"" + key + "\":(\\d+)");
+            long v;
+            return m.Success && long.TryParse(m.Groups[1].Value, out v) ? v : 0;
+        }
+
+        void RefreshCtx(Session s, bool talk)
+        {
+            long t = ContextTokens(s.Transcript);
+            if (t <= 0) return;
+            s.CtxTokens = t;
+            int used = CtxPercent(t);
+            if (used < 50) s.CtxWarned = false;
+            else if (used >= 80 && !s.CtxWarned && talk && cfg.CtxBar)
+            {
+                s.CtxWarned = true;
+                ctxWarnSession = s; ctxWarnAt = DateTime.Now.AddSeconds(6); // 等"完成啦"说完再提醒
+            }
+            UpdateCtxChip();
+        }
+
+        Session CtxSession()
+        {
+            var now = DateTime.Now;
+            Session best = null;
+            foreach (var x in sessions.Values)
+                if (x.CtxTokens > 0 && (x.State != "idle" || (now - x.Last).TotalMinutes < 30) && (best == null || x.Last > best.Last)) best = x;
+            return best;
+        }
+
+        static string Kilo(long t) { return t >= 1000 ? (t / 1000) + "K" : t.ToString(); }
+
+        void UpdateCtxChip()
+        {
+            if (ctxChip == null) return;
+            if (ctxWarnSession != null && DateTime.Now >= ctxWarnAt && !bubbleSticky && IsVisible)
+            {
+                var w = ctxWarnSession; ctxWarnSession = null;
+                Overlay("waiting", 1);
+                Say(ProjectTag(w) + "这个会话的上下文已经用了 " + CtxPercent(w.CtxTokens) + "%，快装满啦。告一段落时可以 /compact 一下，或者开个新会话～", 2, 8000);
+            }
+            var s = cfg.CtxBar ? CtxSession() : null;
+            if (s == null) { if (ctxChip.Visibility != Visibility.Collapsed) ctxChip.Visibility = Visibility.Collapsed; return; }
+            int left = Math.Max(0, 100 - CtxPercent(s.CtxTokens));
+            string txt = left + "%";
+            if (ctxText.Text != txt)
+            {
+                ctxText.Text = txt;
+                ctxFill.Width = 22.0 * left / 100;
+                ctxFill.Fill = left > 50 ? CtxGreen : left > 20 ? CtxYellow : CtxRed;
+            }
+            long win = s.CtxTokens > 200000 ? 1000000 : 200000;
+            string tip = "上下文体力：还剩约 " + left + "%" + (string.IsNullOrEmpty(s.Project) ? "" : "（" + s.Project + "）") +
+                "\n已用 " + Kilo(s.CtxTokens) + " / " + Kilo(win) + " tokens，每次回复完更新" +
+                "\n快用完时可以 /compact 或开新会话";
+            if (tip != ctxTip) { ctxTip = tip; ctxChip.ToolTip = tip; }
+            if (ctxChip.Visibility != Visibility.Visible) ctxChip.Visibility = Visibility.Visible;
+        }
+
+        // ------------------------------------------------------------ 小窗口：光球和下落的萤火各是一个很小的透明窗口，只挪位置不重画
+
+        class FloatWin : Window
+        {
+            public FloatWin(UIElement content, double size, bool clickThrough)
+            {
+                WindowStyle = WindowStyle.None; AllowsTransparency = true; Background = Brushes.Transparent;
+                Topmost = true; ShowInTaskbar = false; ResizeMode = ResizeMode.NoResize; ShowActivated = false;
+                Width = size; Height = size; Content = content;
+                SourceInitialized += (s, e) =>
+                {
+                    var h = new WindowInteropHelper(this).Handle;
+                    int ex = GetWindowLong(h, GWL_EXSTYLE) | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+                    if (clickThrough) ex |= 0x20; // WS_EX_TRANSPARENT：鼠标穿过去
+                    SetWindowLong(h, GWL_EXSTYLE, ex);
+                };
+            }
+        }
+
+        static Brush GlowBall(Color core, Color mid)
+        {
+            var g = new RadialGradientBrush();
+            g.GradientStops.Add(new GradientStop(core, 0));
+            g.GradientStops.Add(new GradientStop(mid, 0.45));
+            g.GradientStops.Add(new GradientStop(Color.FromArgb(0, mid.R, mid.G, mid.B), 1));
+            g.Freeze();
+            return g;
+        }
+        static readonly Brush BallInk = GlowBall(Color.FromRgb(0xFF, 0xFB, 0xE6), Color.FromRgb(0xFF, 0xD5, 0x6A));
+        static readonly Brush BugInk = GlowBall(Color.FromRgb(0xFF, 0xE0, 0xE0), Color.FromRgb(0xFF, 0x4D, 0x4D));
+
+        double PetCenterX { get { return Left + Width / 2; } }
+        double FeetY { get { return Top + BubbleArea + spriteH * 0.92; } }
+
+        // ------------------------------------------------------------ 扔光球：她跑过去接；你也可以拖着光球甩出去
+
+        FloatWin ball;
+        bool ballOn, ballHeld;
+        double bx, by, bvx, bvy, ballFloor, ballAge; // ballAge：这一扔过了多少毫秒
+        readonly Queue<KeyValuePair<double, Point>> ballTrail = new Queue<KeyValuePair<double, Point>>();
+        const double BallSize = 22;
+
+        void ThrowBall()
+        {
+            if (!IsVisible || perched || gameOn) return;
+            var wa = MyWorkArea();
+            if (ball == null)
+            {
+                ball = new FloatWin(new Ellipse { Width = BallSize, Height = BallSize, Fill = BallInk }, BallSize, false) { Cursor = Cursors.Hand };
+                ball.MouseLeftButtonDown += (s, e) => { ballHeld = true; ballTrail.Clear(); ball.CaptureMouse(); e.Handled = true; };
+                ball.MouseMove += (s, e) =>
+                {
+                    if (!ballHeld) return;
+                    var c = CursorDip();
+                    bx = c.X; by = c.Y;
+                    ballTrail.Enqueue(new KeyValuePair<double, Point>(clock.Elapsed.TotalMilliseconds, c));
+                    while (ballTrail.Count > 6) ballTrail.Dequeue();
+                    PlaceBall();
+                };
+                ball.MouseLeftButtonUp += (s, e) => { if (ballHeld) { ballHeld = false; ball.ReleaseMouseCapture(); FlingBall(); } e.Handled = true; };
+            }
+            bx = PetCenterX; by = Top + BubbleArea + spriteH * 0.2;
+            double dir = rnd.Next(2) == 0 ? -1 : 1;
+            if (bx - wa.Left < 320) dir = 1; else if (wa.Right - bx < 320) dir = -1; // 往宽敞的一边扔
+            bvx = dir * (0.25 + rnd.NextDouble() * 0.2); bvy = -(0.75 + rnd.NextDouble() * 0.3);
+            ballFloor = Math.Min(FeetY, wa.Bottom) - BallSize / 2;
+            ballOn = true; ballHeld = false; ballAge = 0;
+            PlaceBall();
+            if (!ball.IsVisible) ball.Show();
+            Overlay("jumping", 1);
+            Say("接球啦——", 1, 1500, true);
+        }
+
+        void PlaceBall() { ball.Left = bx - BallSize / 2; ball.Top = by - BallSize / 2; }
+
+        void FlingBall()
+        {
+            double now = clock.Elapsed.TotalMilliseconds;
+            var pts = ballTrail.Where(x => now - x.Key < 120).ToList();
+            bvx = bvy = 0;
+            if (pts.Count >= 2 && pts[pts.Count - 1].Key - pts[0].Key >= 15)
+            {
+                double dtm = pts[pts.Count - 1].Key - pts[0].Key;
+                bvx = (pts[pts.Count - 1].Value.X - pts[0].Value.X) / dtm; bvy = (pts[pts.Count - 1].Value.Y - pts[0].Value.Y) / dtm;
+                double sp = Math.Sqrt(bvx * bvx + bvy * bvy);
+                if (sp > 2.5) { bvx *= 2.5 / sp; bvy *= 2.5 / sp; }
+            }
+            ballFloor = Math.Min(FeetY, MyWorkArea().Bottom) - BallSize / 2;
+            if (by > ballFloor) by = ballFloor;
+            ballAge = 0;
+        }
+
+        void UpdateBall(double dt)
+        {
+            if (!ballOn) return;
+            ballAge += dt;
+            var wa = MyWorkArea();
+            double minX = wa.Left + spriteW * 0.5, maxX = wa.Right - spriteW * 0.5; // 光球不滚到她够不着的屏幕边
+            if (!ballHeld)
+            {
+                bvy += 0.0025 * dt;
+                bx += bvx * dt; by += bvy * dt;
+                if (bx < minX) { bx = minX; bvx = Math.Abs(bvx) * 0.7; }
+                if (bx > maxX) { bx = maxX; bvx = -Math.Abs(bvx) * 0.7; }
+                if (by < wa.Top + BallSize) { by = wa.Top + BallSize; bvy = Math.Abs(bvy) * 0.5; }
+                if (by >= ballFloor)
+                {
+                    by = ballFloor;
+                    if (bvy > 0.25) { bvy = -bvy * 0.6; bvx *= 0.85; } // 落地弹起
+                    else { bvy = 0; bvx *= Math.Pow(0.996, dt); if (Math.Abs(bvx) < 0.01) bvx = 0; } // 滚着慢下来
+                }
+                PlaceBall();
+            }
+            if (!dragging && !throwing)
+            {
+                double target = bx - Width / 2;
+                if (Math.Abs(target - Left) > 6) { walkTarget = target; walking = true; }
+            }
+            bool low = by > Top + BubbleArea + spriteH * 0.3 && by < FeetY + BallSize;
+            if (!ballHeld && !dragging && Math.Abs(PetCenterX - bx) < spriteW * 0.22 && low && ballAge > 400) { CatchBall(); return; }
+            if (ballAge > 25000) { EndBall(); Say("光球跑丢了…再扔一个？", 1, 2500, true); }
+        }
+
+        void CatchBall()
+        {
+            EndBall();
+            stats.Balls++;
+            statsDirty = true;
+            string[] got = { "接到啦！", "好球～", "嘿嘿，再来一个？", "稳稳接住！" };
+            int xp = PlayXp(1);
+            Overlay("jumping", 1);
+            Firework(spriteW / 2, spriteH * 0.45, GlowGold, 8, 0);
+            Say(got[rnd.Next(got.Length)] + (xp > 0 ? "  +" + xp + " XP" : ""), 1, 2500, true);
+        }
+
+        void EndBall()
+        {
+            if (!ballOn) return;
+            ballOn = false; ballHeld = false; walking = false;
+            if (ball != null) { ball.ReleaseMouseCapture(); ball.Hide(); }
+            SavePos();
+        }
+
+        // 玩耍得的经验每天最多 Growth.PlayXpPerDay 点
+        int PlayXp(int n)
+        {
+            RollDay();
+            n = Math.Max(0, Math.Min(n, Growth.PlayXpPerDay - stats.TodayPlayXp));
+            if (n > 0) { stats.TodayPlayXp += n; GainXp(n, true); }
+            statsDirty = true;
+            return n;
+        }
+
+        // ------------------------------------------------------------ 接萤火小游戏：萤火从屏幕上方落下，拖着她左右接；红色的是 bug，别接
+
+        class Mote { public FloatWin W; public double X, Y, Vy; public bool Bug; }
+        readonly List<Mote> motes = new List<Mote>();
+        readonly Stack<FloatWin> motePool = new Stack<FloatWin>(), bugPool = new Stack<FloatWin>();
+        bool gameOn;
+        double gameStart, nextMote;
+        int gameScore;
+        const double GameMs = 30000, MoteSize = 18;
+
+        void StartGame()
+        {
+            if (gameOn || !IsVisible || perched) return;
+            EndBall();
+            gameOn = true; gameScore = 0; walking = false;
+            gameStart = clock.Elapsed.TotalMilliseconds + 2500; nextMote = gameStart;
+            Overlay("waving", 1);
+            Say("接萤火！按住我左右拖：金色 +1，红色是 bug，-2。准备…", 2, 2500, true);
+        }
+
+        void UpdateGame(double dt)
+        {
+            if (!gameOn) return;
+            double now = clock.Elapsed.TotalMilliseconds;
+            if (now < gameStart) return;
+            double el = now - gameStart;
+            if (el >= GameMs) { EndGame(true); return; }
+            var wa = MyWorkArea();
+            if (now >= nextMote && motes.Count < 10)
+            {
+                bool bug = el > 4000 && rnd.NextDouble() < 0.2;
+                double x = Math.Max(wa.Left + 20, Math.Min(wa.Right - 20, PetCenterX + (rnd.NextDouble() * 2 - 1) * 380));
+                var m = new Mote { X = x, Y = wa.Top + MoteSize, Vy = 0.15 + el / GameMs * 0.17 + rnd.NextDouble() * 0.08, Bug = bug };
+                var pool = bug ? bugPool : motePool;
+                m.W = pool.Count > 0 ? pool.Pop() : new FloatWin(new Ellipse { Width = MoteSize, Height = MoteSize, Fill = bug ? BugInk : BallInk }, MoteSize, true);
+                m.W.Left = m.X - MoteSize / 2; m.W.Top = m.Y - MoteSize / 2;
+                m.W.Show();
+                motes.Add(m);
+                nextMote = now + Math.Max(380, 850 - el / GameMs * 450) * (0.7 + rnd.NextDouble() * 0.6);
+            }
+            double l = Left + (Width - spriteW) / 2, top = Top + BubbleArea;
+            var box = new Rect(l + spriteW * 0.15, top + spriteH * 0.1, spriteW * 0.7, spriteH * 0.75);
+            for (int i = motes.Count - 1; i >= 0; i--)
+            {
+                var m = motes[i];
+                m.Y += m.Vy * dt;
+                if (box.Contains(m.X, m.Y))
+                {
+                    gameScore = Math.Max(0, gameScore + (m.Bug ? -2 : 1));
+                    int secs = (int)Math.Ceiling((GameMs - el) / 1000);
+                    if (m.Bug) { Overlay("failed", 1); Say("呀，是 bug！" + gameScore + " 分 · 还剩 " + secs + " 秒", 1, 1500, true); }
+                    else
+                    {
+                        double k = Math.Max(scale, 0.6), px = m.X - l, py = Math.Max(spriteH * 0.1, m.Y - top);
+                        Particle(Dot(7 * k), GlowGold, px, py, px, py - 30 * k, 500, 0, true);
+                        Say(gameScore + " 分 · 还剩 " + secs + " 秒", 1, 1500, true);
+                    }
+                    RecycleMote(i);
+                    continue;
+                }
+                if (m.Y > wa.Bottom + MoteSize) { RecycleMote(i); continue; }
+                m.W.Top = m.Y - MoteSize / 2;
+            }
+        }
+
+        void RecycleMote(int i)
+        {
+            var m = motes[i];
+            m.W.Hide();
+            (m.Bug ? bugPool : motePool).Push(m.W);
+            motes.RemoveAt(i);
+        }
+
+        void EndGame(bool finished)
+        {
+            if (!gameOn) return;
+            gameOn = false;
+            for (int i = motes.Count - 1; i >= 0; i--) RecycleMote(i);
+            SavePos();
+            if (!finished) return;
+            bool record = gameScore > stats.GameBest;
+            if (record) stats.GameBest = gameScore;
+            statsDirty = true;
+            int xp = PlayXp(gameScore / 3);
+            Overlay("jumping", 1);
+            if (record) FireworkShow();
+            Say("时间到！得了 " + gameScore + " 分" + (record ? "，新纪录！" : "（最高 " + stats.GameBest + " 分）") + (xp > 0 ? "  +" + xp + " XP" : ""), 1, 5000, true);
+        }
+
+        void CloseFloats()
+        {
+            foreach (var m in motes) m.W.Close();
+            motes.Clear();
+            foreach (var w in motePool.Concat(bugPool)) w.Close();
+            motePool.Clear(); bugPool.Clear();
+            if (ball != null) { ball.Close(); ball = null; }
+        }
+
         // ------------------------------------------------------------ 甩出去：松手时还在快速移动，就飞出去落到屏幕底部
 
         double DipScale()
@@ -3529,7 +4036,7 @@ namespace FireflyPet
         {
             if ((t - lastPerchCheck).TotalMilliseconds < 200) return;
             lastPerchCheck = t;
-            bool allowed = cfg.Perch && Growth.Level(stats.Xp) >= Growth.PerchLevel && IsVisible && !pressed && !dragging && !throwing;
+            bool allowed = cfg.Perch && Growth.Level(stats.Xp) >= Growth.PerchLevel && IsVisible && !pressed && !dragging && !throwing && !ballOn && !gameOn && !dodging;
             IntPtr fg = IntPtr.Zero;
             Rect r = Rect.Empty;
             int kind = 0;
@@ -3623,7 +4130,7 @@ namespace FireflyPet
                 .Select(x => new[]
                 {
                     string.IsNullOrEmpty(x.Project) ? "（未知项目）" : x.Project,
-                    StateName(x),
+                    StateName(x) + (x.CtxTokens > 0 ? " · 上下文 " + CtxPercent(x.CtxTokens) + "%" : ""),
                     x.State == "running" && x.PromptAt.HasValue ? "已 " + Elapsed(now - x.PromptAt.Value) : Ago(now - x.Last),
                     x.State,
                 }).ToList();
