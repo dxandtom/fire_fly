@@ -1,0 +1,45 @@
+src/FireflyPet.cs
+  s_198449b1fdbae5::t_73bc11a9c87cfc 238-239,244,246-248,250-252,255-257,263-289
+  s_198449b1fdbae5::t_1490abbe07d239 656
+  s_198449b1fdbae5::t_2c570354a03a16 41-43,61,69-84,143-149,151,185,190,201,211-212,214,217
+  s_198449b1fdbae5::t_b7d8a8aa77f30a 213,237,290,341,645,648-655,657-664,668,674-687,1701
+  s_198449b1fdbae5::t_2ddb5b5531f434 318-321,323-324,327,330-332,336-337,340,739,931,1280,2213-2219
+  s_198449b1fdbae5::t_4418b69341fea6 1726
+  s_198449b1fdbae5::t_fe733edc7b5d82 1753-1758,1762-1765
+  s_198449b1fdbae5::t_f76b1e0f05cb5a 223-236,253-254,291-292,298-299,310,333-335
+  s_198449b1fdbae5::t_82013d76968f96 1693-1695,1700,1702-1708,1720-1725,1727
+  s_198449b1fdbae5::t_b906b73af01a96 1667,1671-1682
+README.md
+  s_198449b1fdbae5::t_2ddb5b5531f434 40
+  s_198449b1fdbae5::t_22c442c63bc541 72-75,86-89,91-93,98
+  s_198449b1fdbae5::t_f7ac958377216e 90
+tests/t_safety.ps1
+  s_198449b1fdbae5::t_2019a088957be2 1-55
+tests/t_report.ps1
+  s_198449b1fdbae5::t_249600cf4aa477 1-55
+tests/t_time.ps1
+  s_198449b1fdbae5::t_cca27335ce86fc 53-63
+  s_198449b1fdbae5::t_249600cf4aa477 1-52,64-80
+tests/t_frames.ps1
+  s_198449b1fdbae5::t_c8afb45f2c51fe 1-36
+tests/mem_host.cs
+  s_198449b1fdbae5::t_22c442c63bc541 1-72
+plugins/firefly-pet/.claude-plugin/plugin.json
+  s_198449b1fdbae5::t_22c442c63bc541 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5+huawei.3",
+  "base_commit_sha": "1112084fce6c272cd64b790edd5f6ac832d8e3bf",
+  "prompts": {},
+  "sessions": {
+    "s_198449b1fdbae5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "543e9973-4fac-44c1-bd40-81a10edecc65",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "dxandtom <x7730716@gmail.com>"
+    }
+  }
+}
