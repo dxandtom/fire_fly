@@ -1,0 +1,39 @@
+tests/t_frames.ps1
+  s_198449b1fdbae5::t_c42d96ca8d4d1a 1-2,36-39,42-43,46-52
+  s_198449b1fdbae5::t_be4c6cd2930141 40-41,44-45
+tests/mem_host.cs
+  s_198449b1fdbae5::t_c3620d7218c255 89-92,94-95
+  s_198449b1fdbae5::t_f3b412e59df05a 6,23-24,113
+  s_198449b1fdbae5::t_b29623a0f3602f 88,93
+  s_198449b1fdbae5::t_d2bcb5d41205b5 55-58,87
+  s_198449b1fdbae5::t_520e519c2c13c4 59-63
+  s_198449b1fdbae5::t_3bca7bdc8bbfaf 74,76-79
+  s_198449b1fdbae5::t_4eb3195c770a5a 5,80-86
+  s_198449b1fdbae5::t_94e8b51d126180 64-73,75
+README.md
+  s_198449b1fdbae5::t_204fd3f898af2f 91,93
+  s_198449b1fdbae5::t_63ad134da91dc1 72,75
+plugins/firefly-pet/.claude-plugin/plugin.json
+  s_198449b1fdbae5::t_25366260dfbf34 3
+src/FireflyPet.cs
+  s_198449b1fdbae5::t_8b9692168ad4cd 1810,2149-2150,2170-2173,2181
+  s_198449b1fdbae5::t_63ad134da91dc1 139-141,1724,1757-1758,2153-2154
+  s_198449b1fdbae5::t_d80627931b1674 1557,1801,1812,1823,2129,2151,2155-2169,2174-2180,2931-2932,2935-2936,2941-2959,2965,2973,3089,3101-3102,3109-3110,3112-3116,3119-3121,3124-3125
+  s_198449b1fdbae5::t_827114b58b0949 2152
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5+huawei.3",
+  "base_commit_sha": "ffa982688480fd37616b54ed9f5b9852ed7be1c4",
+  "prompts": {},
+  "sessions": {
+    "s_198449b1fdbae5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "543e9973-4fac-44c1-bd40-81a10edecc65",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "dxandtom <x7730716@gmail.com>"
+    }
+  }
+}
