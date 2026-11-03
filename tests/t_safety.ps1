@@ -1,4 +1,4 @@
-﻿# 数据安全与进程检测：统计文件的原子保存/备份恢复、claude.exe 快照缓存、前台类型判断
+﻿# 数据安全与进程检测：统计文件的原子保存/备份恢复、claude.exe 快照缓存、前台类型判断、同步安装不倒退
 # 用法：powershell -NoProfile -STA -File tests\t_safety.ps1 [-Exe plugins\firefly-pet\bin\FireflyPet.exe]
 param([string]$Exe = "$PSScriptRoot\..\plugins\firefly-pet\bin\FireflyPet.exe", [string]$Dir = "$env:TEMP\ff-t-safety")
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -50,6 +50,16 @@ if ($ref.Count -gt 0) { Check ("每 3 秒一次的检查耗时 {0:N3}ms（原来
 "6) 前台类型（只报告，不判对错）"
 $desk = $asm.GetType('FireflyPet.Desk')
 "  ForegroundKind = " + $desk.GetMethod('ForegroundKind', $S).Invoke($null, $null) + "（1 桌面端 / 2 终端或编辑器 / 0 其他）"
+
+"7) 同步安装不倒退：安装目录里的 exe 更新时，旧会话的 hook 不覆盖它"
+$sync = $prog.GetMethod('SyncInstall', $S)
+$dst = "$Dir\app\FireflyPet.exe"; New-Item -ItemType Directory "$Dir\app" -Force | Out-Null
+[IO.File]::WriteAllText($dst, 'newer'); [IO.File]::SetLastWriteTimeUtc($dst, [datetime]::UtcNow.AddDays(1))
+$sync.Invoke($null, $null)
+Check '更新的版本保留' ([IO.File]::ReadAllText($dst) -eq 'newer')
+[IO.File]::SetLastWriteTimeUtc($dst, [datetime]::UtcNow.AddDays(-400))
+$sync.Invoke($null, $null)
+Check '更旧的版本被替换' ((Get-Item $dst).Length -eq (Get-Item $Exe).Length)
 
 Remove-Item -Recurse -Force $Dir
 if ($fail) { "失败 $fail 项"; exit 1 } else { "全部通过" }

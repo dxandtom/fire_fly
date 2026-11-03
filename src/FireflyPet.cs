@@ -93,6 +93,12 @@ namespace FireflyPet
             string dst = InstalledExe, dstDir = System.IO.Path.GetDirectoryName(dst);
             if (string.Equals(System.IO.Path.GetFullPath(self), System.IO.Path.GetFullPath(dst), StringComparison.OrdinalIgnoreCase)) return;
             if (File.Exists(dst) && File.ReadAllBytes(dst).SequenceEqual(File.ReadAllBytes(self))) return;
+            // 插件升级后没重启的旧会话，hook 还在用旧插件目录里的 exe：安装目录里已经是更新的版本，就不要倒退回去
+            if (File.Exists(dst) && ExeTime(dst) > ExeTime(self).AddSeconds(2))
+            {
+                Log("安装目录里的版本更新，不用旧版覆盖（来自 " + self + "）");
+                return;
+            }
             Directory.CreateDirectory(System.IO.Path.Combine(dstDir, "assets"));
             foreach (var o in Directory.GetFiles(dstDir, "FireflyPet.exe*.old")) { try { File.Delete(o); } catch { } }
             if (File.Exists(dst)) File.Move(dst, dst + "." + DateTime.Now.Ticks + ".old");
