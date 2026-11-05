@@ -1,0 +1,28 @@
+README.md
+  s_1d1407e19a261b::t_7185f72a01f113 35
+  s_1d1407e19a261b::t_58aa6c256c86b1 101
+src/FireflyPet.cs
+  s_1d1407e19a261b::t_536c138f75fde3 948,1930,2301-2302,3598,3658
+tests/t_play.ps1
+  s_1d1407e19a261b::t_536c138f75fde3 1,177,187,189,197,199,207,209,211
+tests/t_hook.py
+  s_1d1407e19a261b::t_58aa6c256c86b1 80
+plugins/firefly-pet/.claude-plugin/plugin.json
+  s_1d1407e19a261b::t_3d609327a8f678 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5+huawei.3",
+  "base_commit_sha": "58d582e6a60cdc0f614a01865bbc04ff9ec91da1",
+  "prompts": {},
+  "sessions": {
+    "s_1d1407e19a261b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "36660e15-10a6-4884-892d-dc36c8251434",
+        "model": "unknown"
+      },
+      "human_author": "dxandtom <x7730716@gmail.com>"
+    }
+  }
+}
