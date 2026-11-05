@@ -3572,15 +3572,18 @@ namespace FireflyPet
 
         readonly Queue<DateTime> pokes = new Queue<DateTime>();
         bool dodging;
+        DateTime pokeQuietUntil; // 连戳跑开后这段时间里再点她不理，免得新气泡盖掉"别戳啦"
         static readonly string[] PokeLines = { "别、别戳啦！", "哼，不理你了～", "好痒…我躲远一点！", "再戳我就跑啦！" };
 
         bool CheckPoke()
         {
             var now = DateTime.Now;
+            if (dodging || now < pokeQuietUntil) return true; // 正在躲、或刚躲完气泡还没消失：这下点击不算摸头也不计数
             pokes.Enqueue(now);
             while (pokes.Count > 0 && (now - pokes.Peek()).TotalSeconds > 2.5) pokes.Dequeue();
             if (pokes.Count < 5) return false;
             pokes.Clear();
+            pokeQuietUntil = now.AddMilliseconds(2500);
             Say(MyLine("连戳", PokeLines[rnd.Next(PokeLines.Length)]), 1, 2500, true);
             if (perched || throwing || gameOn || ballOn) { Overlay("failed", 1); return true; }
             var wa = MyWorkArea();

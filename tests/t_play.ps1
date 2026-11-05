@@ -152,13 +152,25 @@ M 'OnClick' $null
 
 Check '第 5 下：嘟囔一句并跑开' ((F 'dodging') -and (F 'walking') -and [math]::Abs((F 'walkTarget') - $x0) -ge 60) (Bubble)
 
+$pokeText = Bubble; $pats0 = $st.Pats
+
+for ($i = 0; $i -lt 6; $i++) { M 'OnClick' $null }
+
+Check '跑开途中继续快速点：气泡不被覆盖，也不算摸头' (((Bubble) -eq $pokeText) -and $st.Pats -eq $pats0 -and (F 'dodging')) (Bubble)
+
 for ($i = 0; $i -lt 200 -and (F 'walking'); $i++) { M 'UpdateWander' @([datetime]::Now, [double]33, 'idle') }
 
 Check '跑到了，停下' ((-not (F 'walking')) -and (-not (F 'dodging')) -and [math]::Abs($w.Left - (F 'walkTarget')) -lt 1) $w.Left
 
 M 'OnClick' $null
 
-Check '躲开后重新计数' (-not (F 'dodging')) ''
+Check '刚跑到、气泡还在：点击仍然不理' (((Bubble) -eq $pokeText) -and $st.Pats -eq $pats0) (Bubble)
+
+SetF 'pokeQuietUntil' ([datetime]::MinValue)
+
+M 'OnClick' $null
+
+Check '气泡过后再点：正常摸头，重新计数' ((-not (F 'dodging')) -and $st.Pats -eq $pats0 + 1) $st.Pats
 
 
 
