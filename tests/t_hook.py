@@ -77,7 +77,7 @@ check('error 为对象时写成 JSON 文本', r.get('error', '').startswith('{"c
 
 TP = 'C:' + chr(92) + 'Users' + chr(92) + 'x' + chr(92) + 's1.jsonl'
 hook({'hook_event_name': 'Stop', 'session_id': 's1', 'transcript_path': TP})
-check('Stop 带会话记录路径（体力条用）', last().get('tp') == TP, last())
+check('Stop 带会话记录路径（上下文提醒用）', last().get('tp') == TP, last())
 hook({'hook_event_name': 'PreToolUse', 'session_id': 's1', 'tool_name': 'Read', 'transcript_path': TP, 'tool_input': {}})
 check('其他事件不带路径，事件文件保持精简', 'tp' not in last(), last())
 

@@ -1,4 +1,4 @@
-﻿# v1.6.0：自定义台词、连戳躲开、上下文体力条、扔光球、接萤火小游戏
+﻿# v1.6.0：自定义台词、连戳躲开、上下文快满提醒、扔光球、接萤火小游戏
 
 # 用法：powershell -NoProfile -STA -File tests\t_play.ps1 [-Exe plugins\firefly-pet\bin\FireflyPet.exe]
 
@@ -174,7 +174,7 @@ Check '气泡过后再点：正常摸头，重新计数' ((-not (F 'dodging')) -
 
 
 
-"  3c) 体力条"
+"  3c) 上下文快满提醒"
 
 [IO.File]::WriteAllText($tp, $a1.Replace('40000', '60000'))
 
@@ -184,15 +184,9 @@ Ev 'UserPromptSubmit' @{}
 
 Ev 'Stop' @{}
 
-M 'UpdateCtxChip' $null
+Check '脚下不再有体力条' ($null -eq $pw.GetField('ctxChip', $BF)) ''
 
-$chip = F 'ctxChip'
-
-Check 'Stop 后显示剩余 70%（已用 61503/200K，30%）' ($chip.Visibility -eq 'Visible' -and (F 'ctxText').Text -eq '70%') ((F 'ctxText').Text)
-
-Check '提示里写着已用 61K' ([string]$chip.ToolTip -like '*61K / 200K*') $chip.ToolTip
-
-Check '会话一览也标上下文' ($pw.GetMethod('SessionRows', $BF).Invoke($w, $null)[0][1] -like '*上下文 30%*') ''
+Check '会话一览标上下文 30%（已用 61503/200K）' ($pw.GetMethod('SessionRows', $BF).Invoke($w, $null)[0][1] -like '*上下文 30%*') ''
 
 [IO.File]::WriteAllText($tp, $a1.Replace('40000', '170000'))
 
@@ -200,9 +194,9 @@ Ev 'UserPromptSubmit' @{}; Ev 'Stop' @{}
 
 Check '用到 85%：排队提醒' ($null -ne (F 'ctxWarnSession')) ''
 
-SetF 'ctxWarnAt' ([datetime]::MinValue); SetF 'bubbleSticky' $false; M 'UpdateCtxChip' $null
+SetF 'ctxWarnAt' ([datetime]::MinValue); SetF 'bubbleSticky' $false; M 'CheckCtxWarn' $null
 
-Check '提醒说出来了，条变红' ((Bubble) -like '*上下文已经用了 85%*' -and (F 'ctxText').Text -eq '15%') (Bubble)
+Check '提醒说出来了' ((Bubble) -like '*上下文已经用了 85%*') (Bubble)
 
 Ev 'UserPromptSubmit' @{}; Ev 'Stop' @{}
 
@@ -210,17 +204,13 @@ Check '同一会话不重复提醒' ($null -eq (F 'ctxWarnSession')) ''
 
 Ev 'SessionStart' @{ source = 'compact'; tp = $tp }
 
-M 'UpdateCtxChip' $null
+Check '压缩后一览里先不标，等下次回复' ($pw.GetMethod('SessionRows', $BF).Invoke($w, $null)[0][1] -notlike '*上下文*') ''
 
-Check '压缩后先藏起来，等下次回复再显示' ($chip.Visibility -eq 'Collapsed') ''
+$cfg.CtxBar = $false; Ev 'UserPromptSubmit' @{}; Ev 'Stop' @{}
 
-$cfg.CtxBar = $false; Ev 'UserPromptSubmit' @{}; Ev 'Stop' @{}; M 'UpdateCtxChip' $null
-
-Check '关掉体力条就不显示' ($chip.Visibility -eq 'Collapsed') ''
+Check '关掉提醒后用到 85% 也不提醒' ($null -eq (F 'ctxWarnSession')) ''
 
 $cfg.CtxBar = $true
-
-
 
 "  3d) 扔光球"
 

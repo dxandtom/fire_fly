@@ -945,7 +945,7 @@ namespace FireflyPet
         public bool Perch { get; set; }            // Lv.15：坐在当前窗口的顶边上
         public bool Festive { get; set; }          // 节日特效
         public string Birthday { get; set; }       // 你的生日 MM-dd，这天她放烟花
-        public bool CtxBar { get; set; }           // 脚下显示当前会话的上下文体力条
+        public bool CtxBar { get; set; }           // 会话上下文快满时提醒（名字沿用旧版，保证旧配置能读）
         public string Spritesheet { get; set; }
         public string PetName { get; set; }
 
@@ -1927,7 +1927,7 @@ namespace FireflyPet
                 UpdateAway(idle);
                 CheckFestival(idle);
                 CheckLines();
-                UpdateCtxChip();
+                CheckCtxWarn();
                 var want = TimeSpan.FromMilliseconds(idle > 300 && BaseState() == "idle" && !walking && !throwing && !ballOn && !gameOn ? 250 : 33);
                 if (tick.Interval != want) tick.Interval = want;
             };
@@ -2115,7 +2115,6 @@ namespace FireflyPet
             chip.MouseLeftButtonUp += (s, e) => { OpenSessions(); e.Handled = true; };
             Grid.SetRow(chip, 2);
             root.Children.Add(chip);
-            BuildCtxChip();
             UpdateBadge();
             badge.IsHitTestVisible = true;
             badge.Cursor = Cursors.Hand;
@@ -2299,8 +2298,8 @@ namespace FireflyPet
             look.Click += (s, e) => { cfg.LookAtCursor = !cfg.LookAtCursor; SaveConfig(); };
             m.Items.Add(look);
 
-            var ctx = new MenuItem { Header = "上下文体力条（会话快满时提醒）", IsCheckable = true, IsChecked = cfg.CtxBar };
-            ctx.Click += (s, e) => { cfg.CtxBar = !cfg.CtxBar; SaveConfig(); UpdateCtxChip(); };
+            var ctx = new MenuItem { Header = "会话上下文快满时提醒", IsCheckable = true, IsChecked = cfg.CtxBar };
+            ctx.Click += (s, e) => { cfg.CtxBar = !cfg.CtxBar; SaveConfig(); };
             m.Items.Add(ctx);
 
             bool canWander = lv >= Growth.WanderLevel;
@@ -3596,33 +3595,9 @@ namespace FireflyPet
             return true;
         }
 
-        // ------------------------------------------------------------ 上下文体力条：只读会话记录末尾那条回复里的 token 数，不看聊天内容
+        // ------------------------------------------------------------ 上下文快满提醒：只读会话记录末尾那条回复里的 token 数，不看聊天内容
 
-        Border ctxChip; Rectangle ctxFill; TextBlock ctxText; string ctxTip = "";
         Session ctxWarnSession; DateTime ctxWarnAt;
-        static readonly Brush CtxGreen = Frozen(Color.FromRgb(0x7F, 0xE6, 0xC8)), CtxYellow = Frozen(Color.FromRgb(0xFF, 0xD5, 0x6A)), CtxRed = Frozen(Color.FromRgb(0xFF, 0x6B, 0x6B));
-        static Brush Frozen(Color c) { var b = new SolidColorBrush(c); b.Freeze(); return b; }
-
-        void BuildCtxChip()
-        {
-            ctxText = new TextBlock { FontFamily = new FontFamily("Microsoft YaHei UI"), FontSize = 9, FontWeight = FontWeights.Bold, Foreground = Brushes.White, VerticalAlignment = VerticalAlignment.Center };
-            var bg = new Grid { Width = 22, Height = 3.5, Background = new SolidColorBrush(Color.FromArgb(0x55, 0xFF, 0xFF, 0xFF)), Margin = new Thickness(4, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center };
-            ctxFill = new Rectangle { HorizontalAlignment = HorizontalAlignment.Left, Width = 0 };
-            bg.Children.Add(ctxFill);
-            var sp = new StackPanel { Orientation = Orientation.Horizontal };
-            sp.Children.Add(ctxText);
-            sp.Children.Add(bg);
-            ctxChip = new Border
-            {
-                Child = sp, CornerRadius = new CornerRadius(7), Padding = new Thickness(5, 1, 5, 2),
-                Background = new SolidColorBrush(Color.FromArgb(0xB0, 0x1E, 0x26, 0x2C)),
-                HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Top,
-                RenderTransform = new TranslateTransform(-60, 0), Visibility = Visibility.Collapsed,
-            };
-            Grid.SetRow(ctxChip, 2);
-            root.Children.Add(ctxChip);
-        }
-
         // 窗口按 200K 算；用量已经超过 200K 的会话一定是 1M 窗口
         public static int CtxPercent(long tokens)
         {
@@ -3678,45 +3653,16 @@ namespace FireflyPet
                 s.CtxWarned = true;
                 ctxWarnSession = s; ctxWarnAt = DateTime.Now.AddSeconds(6); // 等"完成啦"说完再提醒
             }
-            UpdateCtxChip();
         }
 
-        Session CtxSession()
+        void CheckCtxWarn()
         {
-            var now = DateTime.Now;
-            Session best = null;
-            foreach (var x in sessions.Values)
-                if (x.CtxTokens > 0 && (x.State != "idle" || (now - x.Last).TotalMinutes < 30) && (best == null || x.Last > best.Last)) best = x;
-            return best;
-        }
-
-        static string Kilo(long t) { return t >= 1000 ? (t / 1000) + "K" : t.ToString(); }
-
-        void UpdateCtxChip()
-        {
-            if (ctxChip == null) return;
             if (ctxWarnSession != null && DateTime.Now >= ctxWarnAt && !bubbleSticky && IsVisible)
             {
                 var w = ctxWarnSession; ctxWarnSession = null;
                 Overlay("waiting", 1);
                 Say(ProjectTag(w) + "这个会话的上下文已经用了 " + CtxPercent(w.CtxTokens) + "%，快装满啦。告一段落时可以 /compact 一下，或者开个新会话～", 2, 8000);
             }
-            var s = cfg.CtxBar ? CtxSession() : null;
-            if (s == null) { if (ctxChip.Visibility != Visibility.Collapsed) ctxChip.Visibility = Visibility.Collapsed; return; }
-            int left = Math.Max(0, 100 - CtxPercent(s.CtxTokens));
-            string txt = left + "%";
-            if (ctxText.Text != txt)
-            {
-                ctxText.Text = txt;
-                ctxFill.Width = 22.0 * left / 100;
-                ctxFill.Fill = left > 50 ? CtxGreen : left > 20 ? CtxYellow : CtxRed;
-            }
-            long win = s.CtxTokens > 200000 ? 1000000 : 200000;
-            string tip = "上下文体力：还剩约 " + left + "%" + (string.IsNullOrEmpty(s.Project) ? "" : "（" + s.Project + "）") +
-                "\n已用 " + Kilo(s.CtxTokens) + " / " + Kilo(win) + " tokens，每次回复完更新" +
-                "\n快用完时可以 /compact 或开新会话";
-            if (tip != ctxTip) { ctxTip = tip; ctxChip.ToolTip = tip; }
-            if (ctxChip.Visibility != Visibility.Visible) ctxChip.Visibility = Visibility.Visible;
         }
 
         // ------------------------------------------------------------ 小窗口：光球和下落的萤火各是一个很小的透明窗口，只挪位置不重画
