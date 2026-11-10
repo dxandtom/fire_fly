@@ -1,0 +1,25 @@
+src/FireflyPet.cs
+  s_1d1407e19a261b::t_84ce657da612d5 3570,3581-3582
+README.md
+  s_1d1407e19a261b::t_84ce657da612d5 41
+tests/t_play.ps1
+  s_1d1407e19a261b::t_84ce657da612d5 145-150,155
+plugins/firefly-pet/.claude-plugin/plugin.json
+  s_1d1407e19a261b::t_e64aeeb2cc77bb 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5+huawei.3",
+  "base_commit_sha": "cba13bf536423f20166f0e63f0fd1f357abb397a",
+  "prompts": {},
+  "sessions": {
+    "s_1d1407e19a261b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "36660e15-10a6-4884-892d-dc36c8251434",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "dxandtom <x7730716@gmail.com>"
+    }
+  }
+}
