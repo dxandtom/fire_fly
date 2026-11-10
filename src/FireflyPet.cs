@@ -3567,7 +3567,7 @@ namespace FireflyPet
             catch (Exception e) { Program.Log("打开台词文件失败: " + e.Message); Say("台词文件打不开…", 1, 3000, true); }
         }
 
-        // ------------------------------------------------------------ 连戳：2.5 秒内点她 5 下，她嘟囔一句，往远离鼠标的方向跑开
+        // ------------------------------------------------------------ 连戳：今天摸头的经验拿满以后，2.5 秒内点她 5 下，她嘟囔一句，往远离鼠标的方向跑开
 
         readonly Queue<DateTime> pokes = new Queue<DateTime>();
         bool dodging;
@@ -3578,6 +3578,8 @@ namespace FireflyPet
         {
             var now = DateTime.Now;
             if (dodging || now < pokeQuietUntil) return true; // 正在躲、或刚躲完气泡还没消失：这下点击不算摸头也不计数
+            RollDay();
+            if (stats.TodayPats < Growth.PatsPerDay) { pokes.Clear(); return false; } // 摸头还加经验时她乐意被摸，不躲
             pokes.Enqueue(now);
             while (pokes.Count > 0 && (now - pokes.Peek()).TotalSeconds > 2.5) pokes.Dequeue();
             if (pokes.Count < 5) return false;

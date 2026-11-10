@@ -142,11 +142,17 @@ Check '没写的分组用自带的' ((M 'MyLine' @('连戳', '默认')) -eq '默
 
 "  3b) 连戳躲开"
 
+$st.TodayPats = 15
+
+for ($i = 0; $i -lt 5; $i++) { M 'OnClick' $null }
+
+Check '摸头还加经验时：连点 5 下也不躲，经验照加' ((-not (F 'dodging')) -and $st.TodayPats -eq 20) $st.TodayPats
+
 $x0 = $w.Left
 
 for ($i = 0; $i -lt 4; $i++) { M 'OnClick' $null }
 
-Check '点 4 下还不躲' (-not (F 'dodging')) ''
+Check '经验拿满后：点 4 下还不躲' (-not (F 'dodging')) ''
 
 M 'OnClick' $null
 
