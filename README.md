@@ -110,4 +110,4 @@ node build.js        # 编译 src/FireflyPet.cs → plugins/firefly-pet/bin/Fire
 
 ## 卸载
 
-`/plugin uninstall firefly-pet@firefly`，再在流萤右键菜单里关掉「开机自启」（或先关掉再卸载）。运行 `~/.claude/firefly-pet/app/FireflyPet.exe --quit` 可以让桌宠和守护进程马上退出。经验数据在 `~/.claude/firefly-pet/`，不需要的话手动删除。
+`/plugin uninstall firefly-pet@firefly`，再在流萤右键菜单里关掉「开机自启」（或先关掉再卸载）。运行 `~/.claude/firefly-pet/app/FireflyPet.exe --quit` 可以让桌宠和守护进程马上退出。经验数据在 `~/.claude/firefly-pet/`，不需要的话手动删除；想留着以后再装回来，保留这个目录即可，等级和统计都会接上。
