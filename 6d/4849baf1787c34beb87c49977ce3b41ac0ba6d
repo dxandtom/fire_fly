@@ -1,0 +1,19 @@
+README.md
+  s_124ba1fa3ac4fd::t_06e59c6043f01f 113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5+huawei.3",
+  "base_commit_sha": "6d4849baf1787c34beb87c49977ce3b41ac0ba6d",
+  "prompts": {},
+  "sessions": {
+    "s_124ba1fa3ac4fd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "18c003c2-5c2f-47d3-b6dd-4cde0cb0aaa7",
+        "model": "DeepSeek-V4.1-Flash-1017"
+      },
+      "human_author": "dxandtom <x7730716@gmail.com>"
+    }
+  }
+}
